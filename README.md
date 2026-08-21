@@ -10,20 +10,38 @@ instalación de DSH aislada en la tree de `node24` del usuario.
 
 ## Comandos
 
-| Comando   | Qué hace                                                                 |
-|-----------|--------------------------------------------------------------------------|
-| `install` | Instala `@deepseek-ai/dsh` globalmente en la tree de `node24`            |
-| `start`   | Arranca el servidor web si no está escuchando ya (idempotente)           |
-| `stop`    | Detiene el proceso que escucha el puerto                                  |
-| `update`  | `uninstall` + `install` limpio de la última versión y lo deja corriendo   |
-| `status`  | Muestra si algo escucha el puerto y si el pidfile quedó stale             |
+| Comando        | Qué hace                                                                 |
+|----------------|--------------------------------------------------------------------------|
+| `install`      | Instala `@deepseek-ai/dsh` globalmente en la tree de `node24`            |
+| `start`        | Arranca el servidor web si no está escuchando ya (idempotente)           |
+| `stop`         | Detiene el proceso que escucha el puerto                                  |
+| `update`       | `uninstall` + `install` limpio de la última versión y lo deja corriendo   |
+| `status`       | Muestra si algo escucha el puerto, pidfile stale y avisa si hay update    |
+| `version`      | Muestra la versión instalada                                              |
+| `check-update` | Compara la versión instalada vs. la última publicada en npm               |
 
 ```
 dsh-manage start
 dsh-manage status
+dsh-manage version
+dsh-manage check-update
 dsh-manage update
 dsh-manage stop
 ```
+
+### `check-update` y `status`
+
+`check-update` consulta el registry de npm y dice si hay una versión más nueva:
+
+```
+instalada:  0.1.1-rc.2
+ultima:     0.1.1-rc.3
+hay actualizacion disponible (0.1.1-rc.2 -> 0.1.1-rc.3)
+corre: dsh-manage update
+```
+
+- Sin red o si npm no responde → reporta que no pudo consultar (no falla el script).
+- `status` incluye un aviso breve de update disponible, sin hacer ruido si estás al día o sin red.
 
 ## Requisitos
 
@@ -55,6 +73,8 @@ Todo tiene defaults razonables y se overridea por variables de entorno:
 | `DSH_PORT`          | `3080`                                 | Puerto donde escucha DSH                |
 | `DSH_START_TIMEOUT` | `180`                                  | Segundos a esperar por el puerto        |
 | `DSH_ALLOW_SCRIPTS` | lista de addons nativos de dsh          | Paquetes a los que npm permite scripts  |
+| `DSH_PKG`           | `@deepseek-ai/dsh`                     | Nombre del paquete npm a instalar        |
+| `DSH_NPM_CACHE`     | `$DSH_HOME/.npm-cache`                 | Cache de npm para consultas de versión   |
 
 Ejemplo con otro home y puerto:
 

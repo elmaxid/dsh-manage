@@ -16,7 +16,7 @@ setup() {
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh"
   [ "$status" -ne 0 ]
   [[ "$output" == *"uso:"* ]]
-  [[ "$output" == *"start|stop|update|status|install"* ]]
+  [[ "$output" == *"start|stop|update|status|install|version|check-update"* ]]
 }
 
 @test "comando invalido imprime uso y falla" {
@@ -34,4 +34,17 @@ setup() {
 @test "crea DSH_HOME al ejecutar status" {
   DSH_PORT="$TEST_PORT" run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" status
   [ -d "$DSH_HOME" ]
+}
+
+@test "version sin instalar reporta que falta y falla" {
+  # DSH_NODE apunta a un dir vacio: ni binario ni package.json existen.
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" version
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no instalado"* ]]
+}
+
+@test "check-update sin instalar reporta que falta" {
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" check-update
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no instalado"* ]]
 }

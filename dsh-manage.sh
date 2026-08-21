@@ -8,7 +8,7 @@
 # tree de node24 (ver DSH_NODE / DSH_PREFIX más abajo).
 #
 # Uso:
-#   dsh-manage {start|stop|update|status|install}
+#   dsh-manage {start|stop|update|status|install|version|check-update}
 #
 # Requiere correr como el usuario que posee el proceso de DSH (normalmente
 # root). port_pid() depende de que `ss` pueda leer los pids de los sockets,
@@ -20,6 +20,8 @@
 #   DSH_PORT          puerto donde DSH escucha (default: 3080)
 #   DSH_START_TIMEOUT segundos a esperar por el puerto (default: 180)
 #   DSH_ALLOW_SCRIPTS paquetes con addons nativos a los que npm permite scripts
+#   DSH_PKG           nombre del paquete npm (default: @deepseek-ai/dsh)
+#   DSH_NPM_CACHE     cache de npm para consultas (default: $DSH_HOME/.npm-cache)
 
 set -euo pipefail
 
@@ -38,6 +40,11 @@ DSH_BIN="$DSH_NODE/dsh"
 # koffi, node-pty y amigos traen addons nativos; el guard de scripts de npm
 # bloquea sus install/postinstall salvo que se listen explícitamente.
 DSH_ALLOW_SCRIPTS="${DSH_ALLOW_SCRIPTS:-@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs}"
+DSH_PKG="${DSH_PKG:-@deepseek-ai/dsh}"
+# Cache propio para `npm view`: el ~/.npm/_cacache del usuario puede ser
+# readonly/compartido (ej. root), lo que hace fallar la consulta. Usar un
+# cache scoped a DSH_HOME evita chocar con el cache compartido.
+DSH_NPM_CACHE="${DSH_NPM_CACHE:-$DSH_HOME/.npm-cache}"
 
 mkdir -p "$DSH_HOME"
 
@@ -144,6 +151,77 @@ update() {
   start
 }
 
+# Versión instalada: se lee del package.json bajo el prefix (autoritativa de
+# lo que npm instaló). Si el binario existe pero falta el package.json, cae
+# a `dsh --version` como fallback.
+installed_version() {
+  local pkg="$DSH_PREFIX/lib/node_modules/$DSH_PKG/package.json"
+  if [ -f "$pkg" ]; then
+    # Extraer el campo "version" sin jq (no se asume instalado).
+    grep -m1 -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$pkg" \
+      | sed -E 's/.*"([^"]+)"$/\1/'
+  elif [ -x "$DSH_BIN" ]; then
+    "$DSH_BIN" --version 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+# Última versión publicada en el registry. Usa cache propio (ver DSH_NPM_CACHE).
+# Falla limpio (código != 0, sin output) si no hay red o npm no responde.
+latest_version() {
+  PATH="$DSH_NODE:$PATH" npm view "$DSH_PKG" version \
+    --cache "$DSH_NPM_CACHE" 2>/dev/null | tail -1
+}
+
+# Compara instalada vs. publicada. Devuelve 0 si hay una versión más nueva
+# disponible, 1 si estás al día (o igual), 2 si no se pudo determinar.
+check_update_available() {
+  local installed latest
+  installed=$(installed_version) || return 2
+  latest=$(latest_version) || return 2
+  if [ -z "$installed" ] || [ -z "$latest" ]; then
+    return 2
+  fi
+  if [ "$installed" != "$latest" ]; then
+    echo "$installed -> $latest"
+    return 0
+  fi
+  return 1
+}
+
+version() {
+  local v
+  v=$(installed_version) || {
+    echo "dsh no instalado ($DSH_BIN no existe)"
+    return 1
+  }
+  echo "$v"
+}
+
+check_update() {
+  local installed latest
+  installed=$(installed_version) || {
+    echo "dsh no instalado, no hay version instalada para comparar"
+    return 1
+  }
+  echo "instalada:  $installed"
+  latest=$(latest_version) 2>/dev/null || true
+  if [ -z "$latest" ]; then
+    echo "no se pudo consultar el registry (sin red o npm fallo)"
+    echo "instalada:  $installed"
+    return 2
+  fi
+  echo "ultima:     $latest"
+  if [ "$installed" != "$latest" ]; then
+    echo "hay actualizacion disponible ($installed -> $latest)"
+    echo "corre: dsh-manage update"
+    return 0
+  fi
+  echo "estas al dia"
+  return 1
+}
+
 status() {
   local existing
   existing=$(port_pid)
@@ -155,13 +233,20 @@ status() {
   if [ -f "$DSH_PID" ] && [ "$(cat "$DSH_PID")" != "$existing" ]; then
     echo "pidfile stale: $(cat "$DSH_PID")"
   fi
+  # Aviso breve de actualización (sin hacer ruido si no se puede consultar).
+  local update_line
+  if update_line=$(check_update_available); then
+    echo "update disponible: $update_line (dsh-manage update)"
+  fi
 }
 
 case "${1:-}" in
-  start)   start ;;
-  stop)    stop ;;
-  update)  update ;;
-  status)  status ;;
-  install) install ;;
-  *) echo "uso: $0 {start|stop|update|status|install}"; exit 1 ;;
+  start)        start ;;
+  stop)         stop ;;
+  update)       update ;;
+  status)       status ;;
+  install)      install ;;
+  version)      version ;;
+  check-update) check_update ;;
+  *) echo "uso: $0 {start|stop|update|status|install|version|check-update}"; exit 1 ;;
 esac

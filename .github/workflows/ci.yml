@@ -21,3 +21,15 @@ jobs:
 
       - name: Batería de tests (bats-core)
         uses: bats-core/bats-action@2.0.0
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # escanear todo el historial, no solo el último commit
+
+      - name: Gitleaks (scan de secretos)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
