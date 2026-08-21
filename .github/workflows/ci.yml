@@ -29,7 +29,11 @@ jobs:
         with:
           fetch-depth: 0   # escanear todo el historial, no solo el último commit
 
-      - name: Gitleaks (scan de secretos)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Gitleaks (scan de secretos sobre todo el historial)
+        run: |
+          set -euo pipefail
+          VERSION=v8.24.3
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/${VERSION}/gitleaks_${VERSION#v}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          chmod +x /tmp/gitleaks
+          /tmp/gitleaks detect --source=. --verbose --redact
