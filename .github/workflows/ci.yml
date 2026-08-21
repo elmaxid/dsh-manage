@@ -17,9 +17,7 @@ jobs:
       - name: Shellcheck
         uses: ludeeus/action-shellcheck@master
         with:
-          files: dsh-manage.sh
+          additional_files: dsh-manage.sh
 
       - name: Batería de tests (bats-core)
         uses: bats-core/bats-action@2.0.0
-        with:
-          working-directory: .
