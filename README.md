@@ -52,8 +52,39 @@ corre: dsh-manage update
 
 ## Instalación
 
-Como el proyecto se versiona en el repo, la vía más simple es copiar el script
-a un lugar del `PATH` en cada puesto:
+### One-liner (recomendado para puestos dev)
+
+Baja `dsh-manage.sh` del repo y lo deja en `/usr/local/bin/dsh-manage`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/elmaxid/dsh-manage/main/install.sh | bash
+```
+
+El instalador muestra el plan, verifica que lo bajado sea un script bash válido
+(shebang) y pide confirmación antes de instalar. Opciones:
+
+| Flag              | Qué hace                                            |
+|-------------------|-----------------------------------------------------|
+| `-y, --yes`       | No pedir confirmación                               |
+| `-v, --verbose`   | Mostrar cada paso en detalle                         |
+| `--prefix <dir>`  | Dir de instalación (default `/usr/local/bin`)       |
+| `--ref <git-ref>` | Versión/branch/tag a bajar (default `main`)         |
+| `--no-color`      | Desactivar colores                                   |
+
+```bash
+# silencioso para automatizar
+curl -fsSL https://raw.githubusercontent.com/elmaxid/dsh-manage/main/install.sh | bash -s -- -y
+
+# inspeccionar antes de ejecutar (más seguro)
+curl -fsSL https://raw.githubusercontent.com/elmaxid/dsh-manage/main/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+> El instalador **no** instala DSH en sí, solo al gestor. Después corrés
+> `dsh-manage install` para instalar `@deepseek-ai/dsh`.
+
+### Manual
 
 ```bash
 sudo cp dsh-manage.sh /usr/local/bin/dsh-manage

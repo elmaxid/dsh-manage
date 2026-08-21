@@ -33,6 +33,10 @@ YES=0
 VERBOSE=0
 NO_COLOR=0
 
+# Defaults vacíos para que err()/die() no crasheen con `set -u` si se llama
+# antes de setup_colors() (ej. parse_args con una opción inválida).
+C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_DIM=""
+
 # ── Colores (con detección de TTY y NO_COLOR) ─────────────────────────────
 setup_colors() {
   if [ "$NO_COLOR" -eq 1 ]; then
