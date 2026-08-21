@@ -1,0 +1,7 @@
+# Artefactos locales generados al operar desde el repo
+dsh.log
+dsh.pid
+
+# Editor / OS
+.DS_Store
+*.swp
