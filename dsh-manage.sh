@@ -70,7 +70,7 @@ wait_for_port() {
 install() {
   echo "instalando @deepseek-ai/dsh (prefix $DSH_PREFIX)..."
   # --prefix: overridea el prefix del ~/.npmrc del usuario (Node viejo) por
-  # comando, sin tocar la config compartida que usa otro servicio del host.
+  # comando, sin tocar la config compartida con otros servicios del host.
   # --allow-scripts: habilita los install/postinstall de los addons nativos
   # que el guard de npm bloquea por defecto.
   PATH="$DSH_NODE:$PATH" npm install -g --prefix "$DSH_PREFIX" \
