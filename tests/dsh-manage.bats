@@ -48,3 +48,42 @@ setup() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"no instalado"* ]]
 }
+
+@test "node_available detecta node ausente" {
+  # DSH_NODE apunta a un dir vacio (setup): no hay binario node.
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && node_available"
+  [ "$status" -ne 0 ]
+}
+
+@test "node_available detecta node presente" {
+  # Simular un binario node ejecutable en DSH_NODE.
+  printf '#!/bin/sh\necho v24.0.0\n' > "$DSH_NODE/node"
+  chmod +x "$DSH_NODE/node"
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && node_available"
+  [ "$status" -eq 0 ]
+}
+
+@test "node_download_url arma una URL valida por arquitectura" {
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && node_download_url v24.19.0 x86_64"
+  [ "$status" -eq 0 ]
+  [[ "$output" == "https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-x64.tar.xz" ]]
+}
+
+@test "node_download_url mapea aarch64 a arm64" {
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && node_download_url v24.19.0 aarch64"
+  [ "$status" -eq 0 ]
+  [[ "$output" == "https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-arm64.tar.xz" ]]
+}
+
+@test "node_download_url rechaza arquitectura desconocida" {
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && node_download_url v24.19.0 sparc64"
+  [ "$status" -ne 0 ]
+}
+
+@test "start hace bootstrap de node si no esta antes de instalar" {
+  # DSH_NODE vacio: start() deberia intentar bootstrap_node antes de install().
+  # No hay red real en el test -> bootstrap_node falla, pero el mensaje de
+  # intento debe aparecer (confirma que se llama, no que se salteo).
+  DSH_PORT="$TEST_PORT" DSH_START_TIMEOUT=1 run timeout 5 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" start
+  [[ "$output" == *"node no encontrado"* ]] || [[ "$output" == *"bootstrap"* ]] || [[ "$output" == *"descargando node"* ]]
+}

@@ -74,7 +74,72 @@ wait_for_port() {
   return 1
 }
 
+# ¿Hay un binario node ejecutable en DSH_NODE? Puesto sin Node instalado
+# todavía (equipo nuevo del staff, réplica limpia) da falso acá.
+node_available() {
+  [ -x "$DSH_NODE/node" ]
+}
+
+# URL del tarball oficial de nodejs.org para una versión + arquitectura dadas
+# (uname -m). Solo mapea las arquitecturas que nodejs.org publica para Linux;
+# cualquier otra falla explícito en vez de armar una URL que 404.
+# @param $1 version (ej. v24.19.0, con la 'v')
+# @param $2 arquitectura de uname -m (ej. x86_64, aarch64)
+node_download_url() {
+  local version="$1" arch="$2" node_arch
+  case "$arch" in
+    x86_64|amd64) node_arch="x64" ;;
+    aarch64|arm64) node_arch="arm64" ;;
+    *)
+      echo "arquitectura no soportada para bootstrap de node: $arch" >&2
+      return 1
+      ;;
+  esac
+  echo "https://nodejs.org/dist/${version}/node-${version}-linux-${node_arch}.tar.xz"
+}
+
+# Descarga y extrae Node oficial en DSH_PREFIX si DSH_NODE no tiene un
+# binario node ejecutable. Idempotente: no hace nada si node_available ya
+# es verdadero. Deja el árbol igual al de un tarball extraído a mano (mismo
+# layout que ya usaba este puesto antes de automatizarlo).
+bootstrap_node() {
+  if node_available; then
+    return 0
+  fi
+  local version url tmp arch
+  version="${DSH_NODE_VERSION:-v24.19.0}"
+  arch="$(uname -m)"
+  echo "node no encontrado en $DSH_NODE — descargando node $version ($arch)..."
+  url="$(node_download_url "$version" "$arch")" || return 1
+  tmp="$(mktemp -d)"
+  if ! curl -fsSL "$url" -o "$tmp/node.tar.xz"; then
+    echo "no se pudo descargar $url" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  mkdir -p "$DSH_PREFIX"
+  # El tarball oficial trae un único directorio raíz (node-vX.Y.Z-linux-arch);
+  # extraerlo y volcar su contenido directo en DSH_PREFIX (mismo layout que
+  # el node24/ manual: bin/, lib/, include/, share/ en la raíz del prefix).
+  tar -xJf "$tmp/node.tar.xz" -C "$tmp"
+  local extracted
+  extracted="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d -name 'node-*')"
+  if [ -z "$extracted" ]; then
+    echo "tarball de node con layout inesperado" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  cp -a "$extracted"/. "$DSH_PREFIX"/
+  rm -rf "$tmp"
+  if ! node_available; then
+    echo "node se descargó pero $DSH_NODE/node sigue sin ser ejecutable" >&2
+    return 1
+  fi
+  echo "node $("$DSH_NODE"/node --version) instalado en $DSH_PREFIX"
+}
+
 install() {
+  bootstrap_node || return 1
   echo "instalando @deepseek-ai/dsh (prefix $DSH_PREFIX)..."
   # --prefix: overridea el prefix del ~/.npmrc del usuario (Node viejo) por
   # comando, sin tocar la config compartida con otros servicios del host.
@@ -239,6 +304,13 @@ status() {
     echo "update disponible: $update_line (dsh-manage update)"
   fi
 }
+
+# --lib: cargar solo las funciones (para tests via `source ... --lib`), sin
+# disparar el dispatcher de comandos. No es un modo de uso normal.
+# shellcheck disable=SC2317  # el exit sí es alcanzable: fallback cuando se ejecuta directo (no via source)
+if [ "${1:-}" = "--lib" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 case "${1:-}" in
   start)        start ;;

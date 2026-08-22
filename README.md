@@ -106,6 +106,7 @@ Todo tiene defaults razonables y se overridea por variables de entorno:
 | `DSH_ALLOW_SCRIPTS` | lista de addons nativos de dsh          | Paquetes a los que npm permite scripts  |
 | `DSH_PKG`           | `@deepseek-ai/dsh`                     | Nombre del paquete npm a instalar        |
 | `DSH_NPM_CACHE`     | `$DSH_HOME/.npm-cache`                 | Cache de npm para consultas de versión   |
+| `DSH_NODE_VERSION`  | `v24.19.0`                             | Versión de Node a descargar si falta     |
 
 Ejemplo con otro home y puerto:
 
@@ -123,6 +124,11 @@ DSH_HOME=/srv/dsh DSH_PORT=3100 dsh-manage start
   `node24`, overrideando por comando el `prefix` fijado en el `~/.npmrc` del
   usuario (que apunta a un Node del sistema demasiado viejo para dsh y que
   comparte otro servicio). Así no se toca la config compartida.
+- **Bootstrap de Node**: si `$DSH_NODE/node` no existe (puesto nuevo, sin
+  Node instalado todavía), `install` descarga el tarball oficial de
+  `nodejs.org` para la arquitectura del equipo (x86_64/aarch64) y lo extrae
+  en `$DSH_PREFIX` antes de instalar dsh — sin necesitar nvm/fnm ni Node
+  preinstalado. Idempotente: si ya hay un `node` ejecutable, no hace nada.
 - **Addons nativos**: `koffi`, `node-pty` y demás traen addons que el guard
   de scripts de npm bloquea salvo que se listen explícitamente con
   `--allow-scripts`.
