@@ -9,6 +9,7 @@
 #
 # Uso:
 #   dsh-manage {start|stop|update|status|install|version|check-update}
+#   dsh-manage --version | -V   # versión del propio script de gestión
 #
 # Requiere correr como el usuario que posee el proceso de DSH (normalmente
 # root). port_pid() depende de que `ss` pueda leer los pids de los sockets,
@@ -24,6 +25,11 @@
 #   DSH_NPM_CACHE     cache de npm para consultas (default: $DSH_HOME/.npm-cache)
 
 set -euo pipefail
+
+# Versión del propio script de gestión (no la de @deepseek-ai/dsh — esa es
+# installed_version/latest_version más abajo). Semver, sin 'v'; el CLI la
+# imprime con 'v' delante. Ver CHANGELOG.md por release.
+DSH_MANAGE_VERSION="1.0.0"
 
 DSH_NODE="${DSH_NODE:-$HOME/.local/dsh-node/node24/bin}"
 DSH_HOME="${DSH_HOME:-$HOME/dsh-test}"
@@ -313,12 +319,13 @@ if [ "${1:-}" = "--lib" ]; then
 fi
 
 case "${1:-}" in
-  start)        start ;;
-  stop)         stop ;;
-  update)       update ;;
-  status)       status ;;
-  install)      install ;;
-  version)      version ;;
-  check-update) check_update ;;
+  start)          start ;;
+  stop)           stop ;;
+  update)         update ;;
+  status)         status ;;
+  install)        install ;;
+  version)        version ;;
+  check-update)   check_update ;;
+  --version|-V)   echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
   *) echo "uso: $0 {start|stop|update|status|install|version|check-update}"; exit 1 ;;
 esac

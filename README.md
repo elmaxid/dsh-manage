@@ -19,6 +19,7 @@ instalación de DSH aislada en la tree de `node24` del usuario.
 | `status`       | Muestra si algo escucha el puerto, pidfile stale y avisa si hay update    |
 | `version`      | Muestra la versión instalada                                              |
 | `check-update` | Compara la versión instalada vs. la última publicada en npm               |
+| `--version`, `-V` | Versión del propio script de gestión (no la de `dsh`) — ver [CHANGELOG](CHANGELOG.md) |
 
 ```
 dsh-manage start
@@ -144,6 +145,12 @@ make test     # batería de tests con bats-core
 ```
 
 El CI corre `bash -n`, `shellcheck` y la batería de `bats` en cada push.
+
+## Versión
+
+`dsh-manage --version` muestra la versión del propio script (distinta de la
+de `dsh` en sí, ver `dsh-manage version`). Historial de cambios en
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Licencia
 

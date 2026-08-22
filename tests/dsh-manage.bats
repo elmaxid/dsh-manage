@@ -87,3 +87,21 @@ setup() {
   DSH_PORT="$TEST_PORT" DSH_START_TIMEOUT=1 run timeout 5 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" start
   [[ "$output" == *"node no encontrado"* ]] || [[ "$output" == *"bootstrap"* ]] || [[ "$output" == *"descargando node"* ]]
 }
+
+@test "--version imprime la version del propio script (semver)" {
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" --version
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ ^dsh-manage\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+@test "-V es alias de --version" {
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" -V
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ ^dsh-manage\ v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+@test "DSH_MANAGE_VERSION esta definida y es semver valido" {
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && echo \"\$DSH_MANAGE_VERSION\""
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
