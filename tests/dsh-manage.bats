@@ -16,7 +16,8 @@ setup() {
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh"
   [ "$status" -ne 0 ]
   [[ "$output" == *"uso:"* ]]
-  [[ "$output" == *"start|stop|update|status|install|version|check-update"* ]]
+  [[ "$output" == *"plugins-install"* ]]
+  [[ "$output" == *"service-install"* ]]
 }
 
 @test "comando invalido imprime uso y falla" {
@@ -104,4 +105,125 @@ setup() {
   run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && echo \"\$DSH_MANAGE_VERSION\""
   [ "$status" -eq 0 ]
   [[ "$output" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+@test "dsh_service_manages_this_home es false sin dsh.service o si no coincide el WorkingDirectory" {
+  # Regresión: plugins_install() reinició por error el dsh.service del HOST
+  # (homónimo, gestionando otro DSH_HOME) al correr contra un profile de
+  # scratch con DSH_HOME distinto -- verificar identidad real, no solo que
+  # el nombre del unit exista.
+  DSH_HOME="$BATS_TEST_TMPDIR/otro-home-que-no-coincide" run bash -c "
+    export DSH_HOME='$BATS_TEST_TMPDIR/otro-home-que-no-coincide'
+    source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && dsh_service_manages_this_home
+  "
+  [ "$status" -ne 0 ]
+}
+
+@test "pnpm_available detecta pnpm ausente" {
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && pnpm_available"
+  [ "$status" -ne 0 ]
+}
+
+@test "pnpm_available detecta pnpm presente" {
+  printf '#!/bin/sh\necho 11.0.0\n' > "$DSH_NODE/pnpm"
+  chmod +x "$DSH_NODE/pnpm"
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && pnpm_available"
+  [ "$status" -eq 0 ]
+}
+
+@test "plugins_install falla si dsh no esta instalado" {
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && plugins_install web"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no instalado"* ]]
+}
+
+@test "plugins_install falla si el manifest no existe" {
+  # Simular dsh instalado (basta con que el binario exista y sea ejecutable)
+  mkdir -p "$(dirname "$(dirname "$DSH_NODE")")"
+  printf '#!/bin/sh\nexit 0\n' > "$DSH_NODE/dsh"
+  chmod +x "$DSH_NODE/dsh"
+  DSH_MANIFEST="$BATS_TEST_TMPDIR/no-existe.json" run bash -c "
+    export DSH_MANIFEST='$BATS_TEST_TMPDIR/no-existe.json'
+    source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && plugins_install web
+  "
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"manifest no encontrado"* ]]
+}
+
+@test "manifest.json del stack de plugins es JSON valido" {
+  run python3 -c "import json; json.load(open('$BATS_TEST_DIRNAME/../plugins/manifest.json'))"
+  [ "$status" -eq 0 ]
+}
+
+@test "manifest.json no incluye dsh-doublecheck en dependencies" {
+  run python3 -c "
+import json
+m = json.load(open('$BATS_TEST_DIRNAME/../plugins/manifest.json'))
+assert 'dsh-doublecheck' not in m['dependencies'], 'dsh-doublecheck no deberia estar en dependencies (incompatible)'
+"
+  [ "$status" -eq 0 ]
+}
+
+@test "manifest.json declara los 3 patches con archivo .patch presente" {
+  run python3 -c "
+import json, os
+base = '$BATS_TEST_DIRNAME/../plugins'
+m = json.load(open(base + '/manifest.json'))
+for spec, path in m['patchedDependencies'].items():
+    full = os.path.join(base, path)
+    assert os.path.isfile(full), f'falta el archivo de patch: {full} (declarado para {spec})'
+"
+  [ "$status" -eq 0 ]
+}
+
+@test "merge-package-json.mjs es idempotente contra un package.json ya completo" {
+  cp "$BATS_TEST_DIRNAME/../plugins/manifest.json" "$BATS_TEST_TMPDIR/manifest.json"
+  node "$BATS_TEST_DIRNAME/../plugins/merge-package-json.mjs" \
+    "$BATS_TEST_TMPDIR/no-existe.json" "$BATS_TEST_TMPDIR/manifest.json" web > "$BATS_TEST_TMPDIR/pkg1.json"
+  node "$BATS_TEST_DIRNAME/../plugins/merge-package-json.mjs" \
+    "$BATS_TEST_TMPDIR/pkg1.json" "$BATS_TEST_TMPDIR/manifest.json" web > "$BATS_TEST_TMPDIR/pkg2.json"
+  run diff "$BATS_TEST_TMPDIR/pkg1.json" "$BATS_TEST_TMPDIR/pkg2.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "merge-package-json.mjs preserva un dependency existente en vez de pisarlo" {
+  cat > "$BATS_TEST_TMPDIR/existing.json" <<'EOF'
+{
+  "name": "dsh-profile-web",
+  "private": true,
+  "dependencies": { "dsh-context": "0.1.0-custom" },
+  "dsh": { "profile": { "bundles": ["dsh-context"] } }
+}
+EOF
+  run node "$BATS_TEST_DIRNAME/../plugins/merge-package-json.mjs" \
+    "$BATS_TEST_TMPDIR/existing.json" "$BATS_TEST_DIRNAME/../plugins/manifest.json" web
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"dsh-context": "0.1.0-custom"'* ]]
+}
+
+@test "merge-pnpm-workspace.py es idempotente contra un pnpm-workspace.yaml ya completo" {
+  python3 "$BATS_TEST_DIRNAME/../plugins/merge-pnpm-workspace.py" \
+    /dev/null "$BATS_TEST_DIRNAME/../plugins/manifest.json" > "$BATS_TEST_TMPDIR/ws1.yaml"
+  python3 "$BATS_TEST_DIRNAME/../plugins/merge-pnpm-workspace.py" \
+    "$BATS_TEST_TMPDIR/ws1.yaml" "$BATS_TEST_DIRNAME/../plugins/manifest.json" > "$BATS_TEST_TMPDIR/ws2.yaml"
+  run diff "$BATS_TEST_TMPDIR/ws1.yaml" "$BATS_TEST_TMPDIR/ws2.yaml"
+  [ "$status" -eq 0 ]
+}
+
+@test "merge-pnpm-workspace.py no fuerza better-sqlite3 a compilar" {
+  run python3 "$BATS_TEST_DIRNAME/../plugins/merge-pnpm-workspace.py" \
+    /dev/null "$BATS_TEST_DIRNAME/../plugins/manifest.json"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"better-sqlite3: false"* ]]
+}
+
+@test "service_install requiere root" {
+  # bats-core corre como el usuario del CI runner (no root); si CI corriera
+  # como root este test se saltea porque no puede simular "no ser root".
+  if [ "$(id -u)" -eq 0 ]; then
+    skip "corriendo como root, no se puede probar el rechazo por no-root"
+  fi
+  run bash -c "source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && service_install"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requiere root"* ]]
 }

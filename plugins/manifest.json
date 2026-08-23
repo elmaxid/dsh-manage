@@ -1,0 +1,82 @@
+{
+  "$comment": "Stack de plugins DSH homologado para el profile 'web' (harness especialista en dev/seguridad/ops). Generado y verificado en un puesto real: cada paquete arrancó limpio (boot sin duplicate/failed-to-load, curl 200) antes de entrar acá. Ver docs/PLUGIN-HOMOLOGATION.md para el detalle de la evaluación uno por uno. Consumido por 'dsh-manage plugins-install'.",
+  "profile": "web",
+  "dependencies": {
+    "@akslcw/dsh-negative-ledger": "^0.1.1",
+    "@fakechris/dsh-restart-recover": "^0.2.1",
+    "@linxin666/dsh-client-ui-git-graph": "^0.2.5",
+    "@linxin666/dsh-client-ui-plugin-manager": "^0.2.5",
+    "@linxin666/dsh-ssh": "^0.2.7",
+    "@perrylink/dsh-skill-pack-security-provider": "^2.1.2",
+    "dsh-better-sidebar": "^0.15.0",
+    "dsh-context": "^0.23.0",
+    "dsh-defend": "^0.1.1",
+    "dsh-graphlint": "^0.3.0",
+    "dsh-guardian": "0.1.0-alpha.2",
+    "dsh-lsp-actions": "^0.3.1",
+    "dsh-plugin-clinic": "^0.1.2",
+    "dsh-plugin-gate": "^1.2.0",
+    "dsh-plugin-verify": "^1.0.0",
+    "dsh-secret-guard": "^0.1.1",
+    "dsh-startup-guard": "^1.0.0",
+    "dsh-test-drive": "^0.2.2",
+    "dsh-tool-describe-image": "^0.4.0",
+    "dshmarket": "^1.16.2"
+  },
+  "bundles": [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "@linxin666/dsh-client-ui-plugin-manager",
+    "dsh-better-sidebar",
+    "dshmarket",
+    "@linxin666/dsh-client-ui-git-graph",
+    "dsh-graphlint",
+    "dsh-lsp-actions",
+    "dsh-plugin-verify",
+    "@perrylink/dsh-skill-pack-security-provider",
+    "dsh-defend",
+    "dsh-secret-guard",
+    "dsh-plugin-gate",
+    "dsh-guardian",
+    "@linxin666/dsh-ssh",
+    "@fakechris/dsh-restart-recover",
+    "@akslcw/dsh-negative-ledger",
+    "dsh-startup-guard",
+    "dsh-plugin-clinic",
+    "dsh-test-drive",
+    "dsh-tool-describe-image",
+    "dsh-context"
+  ],
+  "excluded": {
+    "dsh-doublecheck": "peer-version incompatible con @deepseek-ai/dsh-agent 0.1.1-rc.2 (exige rc.6/rc.8 exacto o rango pre-release estricto que no matchea); queda en estado 'restart' sin activarse nunca. Reintentar cuando el autor publique una versión con peer más permisivo.",
+    "@linxin666/dsh-chat-recovery": "candidato evaluado pero no completó instalación en el host de referencia; no incluido en este manifest hasta reverificarlo end-to-end."
+  },
+  "pnpmWorkspace": {
+    "nodeLinker": "hoisted",
+    "autoInstallPeers": false,
+    "allowBuilds": {
+      "better-sqlite3": false,
+      "cpu-features": true,
+      "node-pty": true,
+      "ssh2": true
+    },
+    "strictDepBuilds": false,
+    "$allowBuildsComment": "better-sqlite3:false porque usa prebuilds oficiales (linux-x64) y no necesita compilar -- strictDepBuilds:false es lo que deja usar ese prebuild sin que pnpm exija aprobar un build nativo que no hace falta. cpu-features/ssh2 (de dsh-ssh) y node-pty (de dsh-better-sidebar) sí compilan nativo, se aprueban explícitamente."
+  },
+  "patchedDependencies": {
+    "dsh-plugin-verify@1.0.0": "patches/dsh-plugin-verify@1.0.0.patch",
+    "dsh-secret-guard@0.1.1": "patches/dsh-secret-guard@0.1.1.patch",
+    "@fakechris/dsh-restart-recover@0.2.1": "patches/@fakechris__dsh-restart-recover@0.2.1.patch"
+  },
+  "patchNotes": {
+    "dsh-plugin-verify@1.0.0": "Bugfix real de schema: output.schema con required:true a nivel raíz (inválido, el DSL de dsh-tools solo lo acepta por-propiedad) + evidence/summary sin additionalProperties explícito. Sin este patch el plugin crashea el árbol entero al boot (JsonSchemaError).",
+    "dsh-secret-guard@0.1.1": "Traducción del mensaje de bloqueo (detección de secretos en comandos) de chino a inglés. Funcionalidad sin cambios.",
+    "@fakechris/dsh-restart-recover@0.2.1": "Traducción de CONTINUE_MESSAGE (mensaje inyectado al reanudar una sesión interrumpida por restart) de chino a inglés. Funcionalidad sin cambios."
+  },
+  "allowScripts": "@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs",
+  "postInstallNotes": [
+    "Tras 'pnpm install', si pnpm bloquea builds nativos no cubiertos por allowBuilds (ssh2/cpu-features/node-pty), correr 'pnpm approve-builds' y aprobar solo esos tres -- no aprobar better-sqlite3 (usa prebuild, no debe compilar).",
+    "dsh-doublecheck y dsh-chat-recovery quedan fuera de este manifest a propósito -- ver 'excluded' arriba.",
+    "El MCP de proyecto (engram, code-review-graph u otros) NO forma parte de este stack base: es específico de cada puesto/proyecto y se agrega aparte editando cordis.patch.yml del profile."
+  ]
+}

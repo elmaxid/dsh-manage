@@ -10,16 +10,18 @@ instalación de DSH aislada en la tree de `node24` del usuario.
 
 ## Comandos
 
-| Comando        | Qué hace                                                                 |
-|----------------|--------------------------------------------------------------------------|
-| `install`      | Instala `@deepseek-ai/dsh` globalmente en la tree de `node24`            |
-| `start`        | Arranca el servidor web si no está escuchando ya (idempotente)           |
-| `stop`         | Detiene el proceso que escucha el puerto                                  |
-| `update`       | `uninstall` + `install` limpio de la última versión y lo deja corriendo   |
-| `status`       | Muestra si algo escucha el puerto, pidfile stale y avisa si hay update    |
-| `version`      | Muestra la versión instalada                                              |
-| `check-update` | Compara la versión instalada vs. la última publicada en npm               |
-| `--version`, `-V` | Versión del propio script de gestión (no la de `dsh`) — ver [CHANGELOG](CHANGELOG.md) |
+| Comando                      | Qué hace                                                                 |
+|------------------------------|--------------------------------------------------------------------------|
+| `install`                    | Instala `@deepseek-ai/dsh` globalmente en la tree de `node24`            |
+| `plugins-install [profile]`  | Instala el stack de plugins homologado (dev/seguridad/ops) en un profile — default `web` |
+| `service-install`            | Instala el watchdog systemd (`dsh.service`, `Restart=always`) — requiere root |
+| `start`                      | Arranca el servidor web si no está escuchando ya (idempotente)           |
+| `stop`                       | Detiene el proceso que escucha el puerto                                  |
+| `update`                     | `uninstall` + `install` limpio de la última versión y lo deja corriendo   |
+| `status`                     | Muestra si algo escucha el puerto, pidfile stale y avisa si hay update    |
+| `version`                    | Muestra la versión instalada                                              |
+| `check-update`               | Compara la versión instalada vs. la última publicada en npm               |
+| `--version`, `-V`            | Versión del propio script de gestión (no la de `dsh`) — ver [CHANGELOG](CHANGELOG.md) |
 
 ```
 dsh-manage start
@@ -29,6 +31,17 @@ dsh-manage check-update
 dsh-manage update
 dsh-manage stop
 ```
+
+### Puesto nuevo, de cero a listo para codear
+
+```bash
+dsh-manage install            # bootstrap de Node (si falta) + @deepseek-ai/dsh
+dsh-manage plugins-install    # stack de ~18 plugins homologado (profile 'web')
+dsh-manage service-install    # watchdog systemd, deja dsh siempre arriba
+```
+
+Tres pasos, cada uno idempotente y re-ejecutable solo si el anterior falla —
+no hace falta reintentar todo desde cero.
 
 ### `check-update` y `status`
 
@@ -43,6 +56,67 @@ corre: dsh-manage update
 
 - Sin red o si npm no responde → reporta que no pudo consultar (no falla el script).
 - `status` incluye un aviso breve de update disponible, sin hacer ruido si estás al día o sin red.
+
+### `plugins-install`: el stack de plugins homologado
+
+Instala en el profile indicado (default `web`) el conjunto de ~18 plugins
+comunitarios evaluados uno por uno en un puesto real — boot limpio
+verificado, sin colisiones de `id`, sin texto de usuario en chino sin
+traducir. La lista completa y el detalle de cada evaluación están en
+[`docs/PLUGIN-HOMOLOGATION.md`](docs/PLUGIN-HOMOLOGATION.md); la fuente de
+verdad que consume el comando es [`plugins/manifest.json`](plugins/manifest.json).
+
+```bash
+dsh-manage plugins-install          # profile 'web' (default)
+dsh-manage plugins-install headless # otro profile
+```
+
+Qué hace, en orden:
+
+1. Verifica que `dsh` ya esté instalado (si no, para y sugiere `install` primero).
+2. Prepara `pnpm` con `corepack` si no está (`node24` lo trae, pero no lo
+   activa hasta la primera vez que hace falta).
+3. **Merge, nunca overwrite**: si el profile ya tiene `package.json` /
+   `pnpm-workspace.yaml` con plugins instalados a mano, se preservan tal
+   cual — el manifest solo agrega lo que falte. Correrlo dos veces es
+   seguro (verificado: reinstalar un plugin ya presente no duplica nada).
+4. Copia los `.patch` del manifest (`pnpm patch` ya aplicado, versionado)
+   sin pisar uno que hayas customizado vos con el mismo nombre de archivo.
+5. `pnpm install --allow-scripts` + `pnpm approve-builds` solo para los
+   addons nativos que realmente lo necesitan (`cpu-features`, `ssh2`,
+   `node-pty` — de `dsh-ssh` y `dsh-better-sidebar`). `better-sqlite3` usa
+   su prebuild oficial y nunca se aprueba para compilar.
+6. Reinicia dsh (via `systemctl` si `dsh.service` existe, si no via
+   `stop`+`start`) y verifica boot real: puerto escuchando + grep de
+   `duplicate`/`failed to load`/`EADDRINUSE` en el log — no solo que el
+   comando haya salido con código 0.
+
+Tres patches de traducción incluidos (ver `plugins/patches/`): dos plugins
+traían mensajes de usuario fijos en chino sin alternativa en inglés
+(`dsh-restart-recover`, `dsh-secret-guard`) — se tradujeron a inglés antes
+de entrar al manifest, mismo mecanismo `pnpm patch` que el bugfix de
+`dsh-plugin-verify`.
+
+Queda **fuera** del stack a propósito: `dsh-doublecheck` (incompatible con
+esta build de DSH — peer-version exacto que no resuelve, nunca llega a
+activarse) y `dsh-chat-recovery` (evaluado pero no llegó a instalación
+completa verificable). El MCP de proyecto (`engram`, `code-review-graph`,
+etc.) tampoco entra: es específico de cada puesto, se agrega editando
+`cordis.patch.yml` del profile aparte.
+
+### `service-install`: watchdog systemd
+
+Escribe y activa un `dsh.service` (`Restart=always`, reinicia solo en 3s si
+el proceso muere) más un `ExecStartPre` defensivo que repara una regresión
+conocida de pnpm en cada boot sin fallar nunca el arranque. Requiere root.
+
+```bash
+sudo dsh-manage service-install
+```
+
+Una vez activo, usar `systemctl {status,stop,restart} dsh.service` en vez
+de `dsh-manage {start,stop}` — ambos mecanismos gestionan el mismo puerto y
+no hay que mezclarlos.
 
 ## Requisitos
 
@@ -108,6 +182,10 @@ Todo tiene defaults razonables y se overridea por variables de entorno:
 | `DSH_PKG`           | `@deepseek-ai/dsh`                     | Nombre del paquete npm a instalar        |
 | `DSH_NPM_CACHE`     | `$DSH_HOME/.npm-cache`                 | Cache de npm para consultas de versión   |
 | `DSH_NODE_VERSION`  | `v24.19.0`                             | Versión de Node a descargar si falta     |
+| `DSH_PROFILES_HOME` | `$HOME/.dsh/profiles`                  | Raíz de profiles del binario `dsh` real (distinto de `DSH_HOME`) |
+| `DSH_MANIFEST`      | `plugins/manifest.json` junto al script | Manifest del stack de plugins a instalar |
+| `DSH_PNPM_VERSION`  | `11.22.0`                              | Versión de pnpm a preparar via corepack   |
+| `DSH_SERVICE_USER`  | usuario actual                         | Usuario que corre el systemd unit         |
 
 Ejemplo con otro home y puerto:
 

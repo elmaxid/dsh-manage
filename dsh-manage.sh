@@ -9,6 +9,8 @@
 #
 # Uso:
 #   dsh-manage {start|stop|update|status|install|version|check-update}
+#   dsh-manage plugins-install [profile]   # instala el stack de plugins homologado
+#   dsh-manage service-install              # instala el watchdog systemd
 #   dsh-manage --version | -V   # versión del propio script de gestión
 #
 # Requiere correr como el usuario que posee el proceso de DSH (normalmente
@@ -23,6 +25,9 @@
 #   DSH_ALLOW_SCRIPTS paquetes con addons nativos a los que npm permite scripts
 #   DSH_PKG           nombre del paquete npm (default: @deepseek-ai/dsh)
 #   DSH_NPM_CACHE     cache de npm para consultas (default: $DSH_HOME/.npm-cache)
+#   DSH_PROFILES_HOME raíz de perfiles de dsh, ~/.dsh/profiles (default: ~/.dsh/profiles)
+#   DSH_MANIFEST      manifest.json del stack de plugins (default: plugins/manifest.json junto al script)
+#   DSH_SERVICE_USER  usuario que corre el systemd unit (default: usuario actual)
 
 set -euo pipefail
 
@@ -51,6 +56,16 @@ DSH_PKG="${DSH_PKG:-@deepseek-ai/dsh}"
 # readonly/compartido (ej. root), lo que hace fallar la consulta. Usar un
 # cache scoped a DSH_HOME evita chocar con el cache compartido.
 DSH_NPM_CACHE="${DSH_NPM_CACHE:-$DSH_HOME/.npm-cache}"
+
+# Raíz de perfiles del binario dsh real (independiente de DSH_HOME de este
+# script, que es solo el directorio de trabajo/logs de dsh-manage — el CLI
+# dsh usa su propio ~/.dsh por convención, sin relación con esa variable).
+DSH_PROFILES_HOME="${DSH_PROFILES_HOME:-$HOME/.dsh/profiles}"
+# Directorio del propio script (para resolver plugins/manifest.json relativo
+# al repo, sin depender del cwd desde donde se invoque dsh-manage).
+DSH_MANAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DSH_MANIFEST="${DSH_MANIFEST:-$DSH_MANAGE_DIR/plugins/manifest.json}"
+DSH_SERVICE_USER="${DSH_SERVICE_USER:-$(id -un)}"
 
 mkdir -p "$DSH_HOME"
 
@@ -173,7 +188,12 @@ start() {
   cd "$DSH_HOME"
   # Binario instalado (no via npx): el proceso que arranca ES el que escucha
   # el puerto. stop() igual mata por PID del puerto, que es lo autoritativo.
-  PATH="$DSH_NODE:$PATH" nohup "$DSH_BIN" web > "$DSH_LOG" 2>&1 &
+  # --port explícito: sin esto, DSH_PORT solo se usaba para *buscar* el
+  # proceso (port_pid), nunca para decirle al binario dónde escuchar — un
+  # DSH_PORT != 3080 arrancaba igual en el puerto default del profile y
+  # wait_for_port nunca lo encontraba (bug real, encontrado al validar
+  # plugins-install contra una instancia de prueba en otro puerto).
+  PATH="$DSH_NODE:$PATH" nohup "$DSH_BIN" web --port "$DSH_PORT" --no-open > "$DSH_LOG" 2>&1 &
   local launched=$!
   echo $launched > "$DSH_PID"
   if wait_for_port; then
@@ -207,6 +227,224 @@ stop() {
     fi
     rm -f "$DSH_PID"
   fi
+}
+
+# ¿Hay un binario pnpm ejecutable en DSH_NODE? node24 trae corepack, pero
+# corepack no deja el shim de pnpm listo hasta que algo lo activa una vez.
+pnpm_available() {
+  [ -x "$DSH_NODE/pnpm" ]
+}
+
+# corepack (bundleado con Node 16.9+) resuelve la versión de pnpm declarada
+# y la deja lista como binario en la misma tree — mismo mecanismo que ya usa
+# este puesto de referencia, verificado idempotente (--activate no rompe una
+# instalación de pnpm ya presente ni requiere red si la versión ya está en
+# el cache de corepack).
+bootstrap_pnpm() {
+  if pnpm_available; then
+    return 0
+  fi
+  echo "pnpm no encontrado en $DSH_NODE — preparándolo con corepack..."
+  if ! PATH="$DSH_NODE:$PATH" corepack prepare "pnpm@${DSH_PNPM_VERSION:-11.22.0}" --activate; then
+    echo "no se pudo preparar pnpm via corepack" >&2
+    return 1
+  fi
+  if ! pnpm_available; then
+    echo "corepack preparó pnpm pero $DSH_NODE/pnpm sigue sin ser ejecutable" >&2
+    return 1
+  fi
+}
+
+# ¿El dsh.service systemd de ESTE host gestiona ESTE DSH_HOME concreto?
+# No basta con que el unit exista y esté enabled — un host puede tener un
+# dsh.service apuntando a otro DSH_HOME (otro profile, otro puesto lógico
+# corriendo en el mismo servidor). Verificado con evidencia real: sin este
+# chequeo, plugins_install() contra un profile de scratch reinició el
+# dsh.service de producción por homónimo, aunque no gestionaba ese profile.
+dsh_service_manages_this_home() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl is-enabled dsh.service >/dev/null 2>&1 || return 1
+  local unit_wd
+  unit_wd="$(systemctl show dsh.service -p WorkingDirectory --value 2>/dev/null)"
+  [ -n "$unit_wd" ] && [ "$unit_wd" = "$DSH_HOME" ]
+}
+
+# Instala el stack de plugins homologado (ver plugins/manifest.json) en un
+# profile de dsh. Separado de install() a propósito: install() solo pone el
+# harness base; esto es una capa aparte, pensada para correrse después (o
+# reintentarse sola si algo falla acá sin tocar el harness).
+#
+# Merge-only, nunca overwrite: si el profile ya tiene plugins instalados a
+# mano, se preservan — el manifest solo agrega lo que falte (mismas reglas
+# que ya se confirmaron seguras a mano con `dsh plugin add` repetido).
+#
+# @param $1 nombre del profile (default: web)
+plugins_install() {
+  local profile="${1:-web}"
+  local profile_dir="$DSH_PROFILES_HOME/$profile"
+
+  if [ ! -x "$DSH_BIN" ]; then
+    echo "dsh no instalado ($DSH_BIN no existe) — corré 'dsh-manage install' primero" >&2
+    return 1
+  fi
+  if [ ! -f "$DSH_MANIFEST" ]; then
+    echo "manifest no encontrado: $DSH_MANIFEST" >&2
+    return 1
+  fi
+
+  bootstrap_pnpm || return 1
+
+  echo "instalando stack de plugins homologado en profile '$profile' ($profile_dir)..."
+  mkdir -p "$profile_dir/patches"
+
+  local existing_pkg="$profile_dir/package.json"
+  local existing_ws="$profile_dir/pnpm-workspace.yaml"
+  local merged_pkg merged_ws
+  merged_pkg="$(node "$DSH_MANAGE_DIR/plugins/merge-package-json.mjs" "$existing_pkg" "$DSH_MANIFEST" "$profile")" \
+    || { echo "fallo el merge de package.json" >&2; return 1; }
+  merged_ws="$(python3 "$DSH_MANAGE_DIR/plugins/merge-pnpm-workspace.py" "$existing_ws" "$DSH_MANIFEST")" \
+    || { echo "fallo el merge de pnpm-workspace.yaml" >&2; return 1; }
+
+  printf '%s' "$merged_pkg" > "$existing_pkg"
+  printf '%s' "$merged_ws" > "$existing_ws"
+
+  # Copiar los .patch declarados en el manifest — no pisar uno que el humano
+  # ya haya customizado a mano con el mismo nombre de archivo.
+  local patch_file dest
+  for patch_file in "$DSH_MANAGE_DIR"/plugins/patches/*.patch; do
+    [ -e "$patch_file" ] || continue
+    dest="$profile_dir/patches/$(basename "$patch_file")"
+    if [ ! -f "$dest" ]; then
+      cp "$patch_file" "$dest"
+    fi
+  done
+
+  echo "corriendo pnpm install..."
+  # pnpm (a diferencia de npm) no tiene un flag --allow-scripts: los builds
+  # nativos se controlan vía pnpm-workspace.yaml (allowBuilds/strictDepBuilds,
+  # ya en el manifest) + `pnpm approve-builds` después del install.
+  (cd "$profile_dir" && PATH="$DSH_NODE:$PATH" pnpm install) \
+    || { echo "pnpm install falló, ver arriba" >&2; return 1; }
+
+  # Aprobar builds nativos declarados en el manifest (ssh2/cpu-features/
+  # node-pty); better-sqlite3 usa prebuild y no debe aprobarse para compilar.
+  local approve_pkgs
+  approve_pkgs="$(node -e "
+    const m = require('$DSH_MANIFEST');
+    const ab = (m.pnpmWorkspace || {}).allowBuilds || {};
+    console.log(Object.entries(ab).filter(([,v]) => v === true).map(([k]) => k).join(' '));
+  ")"
+  if [ -n "$approve_pkgs" ]; then
+    # shellcheck disable=SC2086  # approve_pkgs es una lista de nombres de paquete espaciados, split intencional
+    (cd "$profile_dir" && PATH="$DSH_NODE:$PATH" pnpm approve-builds $approve_pkgs) || true
+  fi
+
+  echo "reiniciando dsh para activar el stack..."
+  if dsh_service_manages_this_home; then
+    systemctl restart dsh.service
+    sleep 3
+  else
+    stop || true
+    sleep 1
+    start
+  fi
+
+  if ! wait_for_port; then
+    echo "dsh no quedó escuchando en :$DSH_PORT tras instalar los plugins, ver $DSH_LOG" >&2
+    return 1
+  fi
+
+  echo "boot OK, verificando errores conocidos en el log..."
+  if grep -qiE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG"; then
+    echo "⚠ se encontraron mensajes de error conocidos en $DSH_LOG — revisar antes de dar por bueno" >&2
+    grep -iE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG" | tail -20
+    return 1
+  fi
+
+  echo "listo: profile '$profile' con el stack de plugins activo en :$DSH_PORT"
+}
+
+# Instala el watchdog systemd de dsh: un unit que lo mantiene arriba
+# (Restart=always) y un ExecStartPre defensivo (dsh-autofix.sh) que repara
+# regresiones conocidas de pnpm en cada boot, sin fallar nunca el arranque.
+# Idempotente: pisa el unit/script con la config actual y hace daemon-reload.
+#
+# El fix de shadowing de @deepseek-ai/{dsh-tools,cosmokit,dsh-fs} local en
+# dsh-autofix.sh probablemente ya no hace falta desde que
+# pnpm-workspace.yaml trae autoInstallPeers:false (causa raíz real) — se
+# mantiene como defensa en profundidad porque es un no-op inofensivo cuando
+# no aplica. El fix de schema de dsh-plugin-verify tampoco debería hacer
+# falta ya que el pnpm patch lo resuelve de forma persistente, pero por el
+# mismo motivo (no-op si no aplica) se deja como red de seguridad.
+service_install() {
+  local unit_path="/etc/systemd/system/dsh.service"
+  local autofix_path="$DSH_HOME/dsh-autofix.sh"
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "service-install requiere root (systemd unit de sistema)" >&2
+    return 1
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl no disponible en este host — omitir service-install" >&2
+    return 1
+  fi
+
+  echo "escribiendo $autofix_path..."
+  cat > "$autofix_path" <<AUTOFIX_EOF
+#!/usr/bin/env bash
+# Generado por 'dsh-manage service-install'. Corre como ExecStartPre de
+# dsh.service, antes de cada boot (incluidos los reintentos de
+# Restart=always). Repara regresiones conocidas causadas por pnpm al
+# reinstalar el profile cuando se agrega/quita un plugin via Plugin Manager.
+# Nunca falla el boot: cada paso es best-effort, el script siempre sale 0.
+
+PROFILE_DIR="$DSH_PROFILES_HOME/web"
+SCOPE_DIR="\$PROFILE_DIR/node_modules/@deepseek-ai"
+
+# Fix 1: una reinstalación de pnpm puede hoistear una copia LOCAL de
+# @deepseek-ai/{dsh-tools,cosmokit,dsh-fs} dentro del profile, shadowing el
+# global de dsh. Dos instancias de dsh-tools == dos identidades de Symbol
+# distintas, y el runtime de tools deja de reconocer su propio scheduler
+# ("Cannot read properties of undefined (reading 'prepare')"). Quitar la
+# copia local hace que la resolución caiga al global correcto.
+for pkg in dsh-tools cosmokit dsh-fs; do
+  if [ -d "\$SCOPE_DIR/\$pkg" ]; then
+    rm -rf "\$SCOPE_DIR/\$pkg" 2>/dev/null || true
+  fi
+done
+
+exit 0
+AUTOFIX_EOF
+  chmod +x "$autofix_path"
+
+  echo "escribiendo $unit_path..."
+  cat > "$unit_path" <<UNIT_EOF
+[Unit]
+Description=DeepSeek Harness (dsh) web server
+After=network.target
+
+[Service]
+Type=simple
+User=$DSH_SERVICE_USER
+WorkingDirectory=$DSH_HOME
+Environment=PATH=$DSH_NODE:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=$HOME
+ExecStartPre=$autofix_path
+ExecStart=$DSH_BIN web
+Restart=always
+RestartSec=3
+StandardOutput=append:$DSH_LOG
+StandardError=append:$DSH_LOG
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+  systemctl daemon-reload
+  systemctl enable dsh.service
+  systemctl restart dsh.service
+  echo "dsh.service instalado y activo. Usar 'systemctl {status,stop,restart} dsh.service' de acá en más"
+  echo "(no mezclar con 'dsh-manage {start,stop}' mientras el unit esté activo — ambos gestionan el mismo puerto)"
 }
 
 update() {
@@ -319,13 +557,15 @@ if [ "${1:-}" = "--lib" ]; then
 fi
 
 case "${1:-}" in
-  start)          start ;;
-  stop)           stop ;;
-  update)         update ;;
-  status)         status ;;
-  install)        install ;;
-  version)        version ;;
-  check-update)   check_update ;;
-  --version|-V)   echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
-  *) echo "uso: $0 {start|stop|update|status|install|version|check-update}"; exit 1 ;;
+  start)            start ;;
+  stop)             stop ;;
+  update)           update ;;
+  status)           status ;;
+  install)          install ;;
+  plugins-install)  plugins_install "${2:-}" ;;
+  service-install)  service_install ;;
+  version)          version ;;
+  check-update)     check_update ;;
+  --version|-V)     echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
+  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|version|check-update}"; exit 1 ;;
 esac

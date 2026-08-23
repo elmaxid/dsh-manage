@@ -1,0 +1,13 @@
+diff --git a/lib/index.js b/lib/index.js
+index 0e477483679ee1bc53a36e7b450db40a8e96aba0..65c052da6ded25c2ac9dd255863eceaa31cd8769 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -41,7 +41,7 @@ export function lastTurnInterrupted(events) {
+     return false;
+ }
+ /** The continuation message injected into a resumed interrupted session. */
+-export const CONTINUE_MESSAGE = '检测到上次会话因重启被中断，请继续之前的工作。若存在结果未知的工具调用，请先核查其实际影响再决定是否重试（只对只读或幂等操作直接重试）。';
++export const CONTINUE_MESSAGE = 'The previous session was interrupted by a restart; please continue the prior work. For any tool call whose result is unknown, verify its actual effect first before deciding whether to retry (retry directly only for read-only or idempotent operations).';
+ export function apply(ctx, config) {
+     const enabled = config?.enabled ?? true;
+     if (!enabled)

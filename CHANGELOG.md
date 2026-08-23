@@ -3,6 +3,36 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/),
 versionado según [SemVer](https://semver.org/lang/es/).
 
+## [Unreleased]
+
+### Agregado
+
+- `dsh-manage plugins-install [profile]` — instala el stack de ~18 plugins
+  homologados (dev/calidad, seguridad, ops, observabilidad) en un profile de
+  dsh (default `web`). Fuente de verdad declarativa en
+  `plugins/manifest.json`; merge-only (nunca overwrite) contra un
+  `package.json`/`pnpm-workspace.yaml` ya existente. Prepara `pnpm` con
+  `corepack` si falta, corre `pnpm install --allow-scripts` +
+  `pnpm approve-builds` solo para los addons nativos que lo necesitan
+  (`cpu-features`, `ssh2`, `node-pty`), reinicia dsh y verifica boot real
+  (puerto + grep de errores conocidos en el log).
+- `dsh-manage service-install` — instala y activa el watchdog systemd
+  (`dsh.service`, `Restart=always`) con un `ExecStartPre` defensivo
+  (`dsh-autofix.sh`) generado con las rutas reales del puesto. Requiere root.
+- `plugins/manifest.json` — manifest versionado del stack de plugins:
+  dependencias, bundles, `allowBuilds`, `patchedDependencies` y exclusiones
+  documentadas (`dsh-doublecheck` por incompatibilidad de peer-version,
+  `dsh-chat-recovery` por instalación no verificada).
+- `plugins/patches/` — 3 patches `pnpm patch` versionados: el bugfix de
+  schema de `dsh-plugin-verify` (ya existente, ahora empaquetado) y 2
+  patches nuevos de traducción chino→inglés para mensajes de usuario
+  hardcodeados en `dsh-restart-recover` (mensaje de reanudación tras
+  restart) y `dsh-secret-guard` (mensaje de bloqueo de secretos) — ninguno
+  de los dos traía alternativa en inglés en la versión publicada.
+- `plugins/merge-package-json.mjs` y `plugins/merge-pnpm-workspace.py` —
+  helpers de merge idempotente usados por `plugins-install`, testeados por
+  separado (idempotencia, no pisar un valor customizado a mano).
+
 ## [1.0.0] - 2026-08-22
 
 Primera versión estable. Script de instalación/administración de DeepSeek

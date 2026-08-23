@@ -1,0 +1,22 @@
+diff --git a/lib/index.js b/lib/index.js
+index 489acb2792bec83f12a6f7f8653a03cda7fa6ed3..a135037ca6f2d28af55f15c1c36c885a329bac07 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -127,15 +127,14 @@ function apply(ctx, config) {
+       schema: {
+         type: "object",
+         additionalProperties: false,
+-        required: true,
+         properties: {
+           action: { type: "string", required: true },
+           ok: { type: "boolean", required: true },
+           detail: { type: "string", required: true },
+           verdict: { type: "string" },
+           score: { type: "integer" },
+-          evidence: { type: "array", items: { type: "object" } },
+-          summary: { type: "object" },
++          evidence: { type: "array", items: { type: "object", additionalProperties: true } },
++          summary: { type: "object", additionalProperties: true },
+         },
+       },
+       render: (_args, value) => {

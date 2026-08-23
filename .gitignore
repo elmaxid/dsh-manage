@@ -1,6 +1,7 @@
 # Artefactos locales generados al operar desde el repo
 dsh.log
 dsh.pid
+.ledger/
 
 # Editor / OS
 .DS_Store
