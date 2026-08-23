@@ -175,22 +175,32 @@ Todo tiene defaults razonables y se overridea por variables de entorno:
 | Variable            | Default                                | Descripción                            |
 |---------------------|----------------------------------------|----------------------------------------|
 | `DSH_NODE`          | `$HOME/.local/dsh-node/node24/bin`     | Dir de los binarios node/npm/dsh        |
-| `DSH_HOME`          | `$HOME/dsh-test`                       | Dir de trabajo, log y pidfile           |
+| `DSH_MANAGE_HOME`   | `$HOME/dsh-test`                       | Dir de trabajo, log y pidfile **de este script** |
+| `DSH_HOME`          | `$HOME/.dsh`                           | Config real del binario `dsh` (profiles, `cordis.patch.yml`) — **no confundir con `DSH_MANAGE_HOME`** |
 | `DSH_PORT`          | `3080`                                 | Puerto donde escucha DSH                |
 | `DSH_START_TIMEOUT` | `180`                                  | Segundos a esperar por el puerto        |
 | `DSH_ALLOW_SCRIPTS` | lista de addons nativos de dsh          | Paquetes a los que npm permite scripts  |
 | `DSH_PKG`           | `@deepseek-ai/dsh`                     | Nombre del paquete npm a instalar        |
-| `DSH_NPM_CACHE`     | `$DSH_HOME/.npm-cache`                 | Cache de npm para consultas de versión   |
+| `DSH_NPM_CACHE`     | `$DSH_MANAGE_HOME/.npm-cache`          | Cache de npm para consultas de versión   |
 | `DSH_NODE_VERSION`  | `v24.19.0`                             | Versión de Node a descargar si falta     |
-| `DSH_PROFILES_HOME` | `$HOME/.dsh/profiles`                  | Raíz de profiles del binario `dsh` real (distinto de `DSH_HOME`) |
 | `DSH_MANIFEST`      | `plugins/manifest.json` junto al script | Manifest del stack de plugins a instalar |
 | `DSH_PNPM_VERSION`  | `11.22.0`                              | Versión de pnpm a preparar via corepack   |
 | `DSH_SERVICE_USER`  | usuario actual                         | Usuario que corre el systemd unit         |
 
-Ejemplo con otro home y puerto:
+> ⚠️ **`DSH_HOME` vs `DSH_MANAGE_HOME`**: son variables distintas a propósito.
+> `DSH_HOME` es la MISMA que usa el binario `dsh` internamente para ubicar
+> `profiles/`; `plugins-install` y `service-install` la necesitan igual a la
+> del `dsh` real, o instalan los plugins en un lugar que el proceso real
+> nunca lee (bug real que hubo acá — ver CHANGELOG). Si corrés `dsh-manage`
+> **desde una sesión de agente DSH** el harness ya te exporta
+> `DSH_HOME=~/.dsh` en el entorno — dejalo así, es el valor correcto.
+> `DSH_MANAGE_HOME` es aparte: el dir de trabajo/log/pid de este script
+> nomás, sin relación con la config real de `dsh`.
+
+Ejemplo con otro dir de trabajo y puerto:
 
 ```bash
-DSH_HOME=/srv/dsh DSH_PORT=3100 dsh-manage start
+DSH_MANAGE_HOME=/srv/dsh-manage DSH_PORT=3100 dsh-manage start
 ```
 
 ## Cómo funciona

@@ -6,10 +6,16 @@
 # un servidor); los casos cubren la logica pura (argumentos, status, parseo).
 
 setup() {
-  export DSH_HOME="$BATS_TEST_TMPDIR/home"
+  export DSH_MANAGE_HOME="$BATS_TEST_TMPDIR/home"
+  # DSH_HOME (config real de dsh, distinta de DSH_MANAGE_HOME) también se
+  # fija a un dir de test: sin esto heredaría el DSH_HOME real del entorno
+  # (ej. ~/.dsh de una sesión de agente DSH corriendo los tests), y algunos
+  # tests de plugins_install/dsh_service_manages_this_home dependen de que
+  # sea un valor controlado y aislado.
+  export DSH_HOME="$BATS_TEST_TMPDIR/dsh-home"
   export DSH_NODE="$BATS_TEST_TMPDIR/bin"
   export TEST_PORT="${TEST_PORT:-39991}"
-  mkdir -p "$DSH_HOME" "$DSH_NODE"
+  mkdir -p "$DSH_MANAGE_HOME" "$DSH_HOME" "$DSH_NODE"
 }
 
 @test "sin argumentos imprime uso y falla" {
@@ -32,9 +38,9 @@ setup() {
   [[ "$output" == *"nada escuchando en :$TEST_PORT"* ]]
 }
 
-@test "crea DSH_HOME al ejecutar status" {
+@test "crea DSH_MANAGE_HOME al ejecutar status" {
   DSH_PORT="$TEST_PORT" run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" status
-  [ -d "$DSH_HOME" ]
+  [ -d "$DSH_MANAGE_HOME" ]
 }
 
 @test "version sin instalar reporta que falta y falla" {
@@ -109,11 +115,11 @@ setup() {
 
 @test "dsh_service_manages_this_home es false sin dsh.service o si no coincide el WorkingDirectory" {
   # Regresión: plugins_install() reinició por error el dsh.service del HOST
-  # (homónimo, gestionando otro DSH_HOME) al correr contra un profile de
-  # scratch con DSH_HOME distinto -- verificar identidad real, no solo que
-  # el nombre del unit exista.
-  DSH_HOME="$BATS_TEST_TMPDIR/otro-home-que-no-coincide" run bash -c "
-    export DSH_HOME='$BATS_TEST_TMPDIR/otro-home-que-no-coincide'
+  # (homónimo, gestionando otro DSH_MANAGE_HOME) al correr contra un profile
+  # de scratch con DSH_MANAGE_HOME distinto -- verificar identidad real
+  # (WorkingDirectory del unit), no solo que el nombre del unit exista.
+  run bash -c "
+    export DSH_MANAGE_HOME='$BATS_TEST_TMPDIR/otro-home-que-no-coincide'
     source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && dsh_service_manages_this_home
   "
   [ "$status" -ne 0 ]

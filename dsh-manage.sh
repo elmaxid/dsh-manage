@@ -19,13 +19,18 @@
 #
 # Variables de entorno (con defaults razonables):
 #   DSH_NODE          dir del binario node/npm/dsh (default: node24 tree)
-#   DSH_HOME          directorio de trabajo y de logs
+#   DSH_MANAGE_HOME   directorio de trabajo/log/pid DE ESTE SCRIPT (default: ~/dsh-test)
+#   DSH_HOME          config real del binario dsh (profiles, cordis.patch.yml —
+#                     default: ~/.dsh, MISMA variable que usa `dsh` internamente,
+#                     no la confundas con DSH_MANAGE_HOME de arriba: si corrés
+#                     dsh-manage desde una sesión de agente DSH, el propio
+#                     harness ya te exporta DSH_HOME=~/.dsh en el entorno —
+#                     es lo correcto para plugins-install, no para el resto)
 #   DSH_PORT          puerto donde DSH escucha (default: 3080)
 #   DSH_START_TIMEOUT segundos a esperar por el puerto (default: 180)
 #   DSH_ALLOW_SCRIPTS paquetes con addons nativos a los que npm permite scripts
 #   DSH_PKG           nombre del paquete npm (default: @deepseek-ai/dsh)
-#   DSH_NPM_CACHE     cache de npm para consultas (default: $DSH_HOME/.npm-cache)
-#   DSH_PROFILES_HOME raíz de perfiles de dsh, ~/.dsh/profiles (default: ~/.dsh/profiles)
+#   DSH_NPM_CACHE     cache de npm para consultas (default: $DSH_MANAGE_HOME/.npm-cache)
 #   DSH_MANIFEST      manifest.json del stack de plugins (default: plugins/manifest.json junto al script)
 #   DSH_SERVICE_USER  usuario que corre el systemd unit (default: usuario actual)
 
@@ -37,9 +42,15 @@ set -euo pipefail
 DSH_MANAGE_VERSION="1.0.0"
 
 DSH_NODE="${DSH_NODE:-$HOME/.local/dsh-node/node24/bin}"
-DSH_HOME="${DSH_HOME:-$HOME/dsh-test}"
-DSH_LOG="$DSH_HOME/dsh.log"
-DSH_PID="$DSH_HOME/dsh.pid"
+# Directorio de trabajo/log/pid DE ESTE SCRIPT — NO confundir con DSH_HOME,
+# que es la variable que usa el binario dsh real para su propia config
+# (profiles, cordis.patch.yml). Antes ambos vivían bajo el mismo nombre
+# DSH_HOME acá, lo que colisionaba de verdad: correr dsh-manage desde una
+# sesión de agente DSH hereda DSH_HOME=~/.dsh del entorno del harness, y ese
+# valor se filtraba silenciosamente al working dir de este script.
+DSH_MANAGE_HOME="${DSH_MANAGE_HOME:-$HOME/dsh-test}"
+DSH_LOG="$DSH_MANAGE_HOME/dsh.log"
+DSH_PID="$DSH_MANAGE_HOME/dsh.pid"
 DSH_PORT="${DSH_PORT:-3080}"
 DSH_START_TIMEOUT="${DSH_START_TIMEOUT:-180}"
 # @deepseek-ai/dsh instalado globalmente, --prefix scoped a la tree de node24
@@ -54,20 +65,22 @@ DSH_ALLOW_SCRIPTS="${DSH_ALLOW_SCRIPTS:-@deepseek-ai/dsh-subprocess-local,koffi,
 DSH_PKG="${DSH_PKG:-@deepseek-ai/dsh}"
 # Cache propio para `npm view`: el ~/.npm/_cacache del usuario puede ser
 # readonly/compartido (ej. root), lo que hace fallar la consulta. Usar un
-# cache scoped a DSH_HOME evita chocar con el cache compartido.
-DSH_NPM_CACHE="${DSH_NPM_CACHE:-$DSH_HOME/.npm-cache}"
+# cache scoped a DSH_MANAGE_HOME evita chocar con el cache compartido.
+DSH_NPM_CACHE="${DSH_NPM_CACHE:-$DSH_MANAGE_HOME/.npm-cache}"
 
-# Raíz de perfiles del binario dsh real (independiente de DSH_HOME de este
-# script, que es solo el directorio de trabajo/logs de dsh-manage — el CLI
-# dsh usa su propio ~/.dsh por convención, sin relación con esa variable).
-DSH_PROFILES_HOME="${DSH_PROFILES_HOME:-$HOME/.dsh/profiles}"
+# Config real del binario dsh (default ~/.dsh, MISMA convención que usa dsh
+# internamente — "the profile under $DSH_HOME/profiles to boot" según su
+# propio --help). A propósito NO se inventa una variable separada acá:
+# plugins_install() tiene que escribir exactamente donde el binario real va
+# a buscar, y ese lugar es $DSH_HOME/profiles/<name>, no otro.
+DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 # Directorio del propio script (para resolver plugins/manifest.json relativo
 # al repo, sin depender del cwd desde donde se invoque dsh-manage).
 DSH_MANAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DSH_MANIFEST="${DSH_MANIFEST:-$DSH_MANAGE_DIR/plugins/manifest.json}"
 DSH_SERVICE_USER="${DSH_SERVICE_USER:-$(id -un)}"
 
-mkdir -p "$DSH_HOME"
+mkdir -p "$DSH_MANAGE_HOME"
 
 # El pid que escucha el puerto es la autoridad: un pidfile solo puede quedar
 # stale tras un reboot/crash (el PID puede ser reutilizado por otro proceso).
@@ -185,7 +198,7 @@ start() {
     echo "dsh no instalado ($DSH_BIN no existe) — instalando primero..."
     install
   fi
-  cd "$DSH_HOME"
+  cd "$DSH_MANAGE_HOME"
   # Binario instalado (no via npx): el proceso que arranca ES el que escucha
   # el puerto. stop() igual mata por PID del puerto, que es lo autoritativo.
   # --port explícito: sin esto, DSH_PORT solo se usaba para *buscar* el
@@ -255,18 +268,20 @@ bootstrap_pnpm() {
   fi
 }
 
-# ¿El dsh.service systemd de ESTE host gestiona ESTE DSH_HOME concreto?
-# No basta con que el unit exista y esté enabled — un host puede tener un
-# dsh.service apuntando a otro DSH_HOME (otro profile, otro puesto lógico
+# ¿El dsh.service systemd de ESTE host gestiona ESTA instancia de dsh-manage
+# concreta? No basta con que el unit exista y esté enabled — un host puede
+# tener un dsh.service apuntando a otro DSH_MANAGE_HOME (otro puesto lógico
 # corriendo en el mismo servidor). Verificado con evidencia real: sin este
 # chequeo, plugins_install() contra un profile de scratch reinició el
-# dsh.service de producción por homónimo, aunque no gestionaba ese profile.
+# dsh.service de producción por homónimo, aunque no gestionaba esa instancia.
+# Compara WorkingDirectory (= DSH_MANAGE_HOME, ver service_install) — NO
+# DSH_HOME, que es la config real de dsh y no aparece en el unit como cwd.
 dsh_service_manages_this_home() {
   command -v systemctl >/dev/null 2>&1 || return 1
   systemctl is-enabled dsh.service >/dev/null 2>&1 || return 1
   local unit_wd
   unit_wd="$(systemctl show dsh.service -p WorkingDirectory --value 2>/dev/null)"
-  [ -n "$unit_wd" ] && [ "$unit_wd" = "$DSH_HOME" ]
+  [ -n "$unit_wd" ] && [ "$unit_wd" = "$DSH_MANAGE_HOME" ]
 }
 
 # Instala el stack de plugins homologado (ver plugins/manifest.json) en un
@@ -281,7 +296,7 @@ dsh_service_manages_this_home() {
 # @param $1 nombre del profile (default: web)
 plugins_install() {
   local profile="${1:-web}"
-  local profile_dir="$DSH_PROFILES_HOME/$profile"
+  local profile_dir="$DSH_HOME/profiles/$profile"
 
   if [ ! -x "$DSH_BIN" ]; then
     echo "dsh no instalado ($DSH_BIN no existe) — corré 'dsh-manage install' primero" >&2
@@ -378,7 +393,7 @@ plugins_install() {
 # mismo motivo (no-op si no aplica) se deja como red de seguridad.
 service_install() {
   local unit_path="/etc/systemd/system/dsh.service"
-  local autofix_path="$DSH_HOME/dsh-autofix.sh"
+  local autofix_path="$DSH_MANAGE_HOME/dsh-autofix.sh"
 
   if [ "$(id -u)" -ne 0 ]; then
     echo "service-install requiere root (systemd unit de sistema)" >&2
@@ -398,7 +413,7 @@ service_install() {
 # reinstalar el profile cuando se agrega/quita un plugin via Plugin Manager.
 # Nunca falla el boot: cada paso es best-effort, el script siempre sale 0.
 
-PROFILE_DIR="$DSH_PROFILES_HOME/web"
+PROFILE_DIR="$DSH_HOME/profiles/web"
 SCOPE_DIR="\$PROFILE_DIR/node_modules/@deepseek-ai"
 
 # Fix 1: una reinstalación de pnpm puede hoistear una copia LOCAL de
@@ -426,11 +441,12 @@ After=network.target
 [Service]
 Type=simple
 User=$DSH_SERVICE_USER
-WorkingDirectory=$DSH_HOME
+WorkingDirectory=$DSH_MANAGE_HOME
 Environment=PATH=$DSH_NODE:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=HOME=$HOME
+Environment=DSH_HOME=$DSH_HOME
 ExecStartPre=$autofix_path
-ExecStart=$DSH_BIN web
+ExecStart=$DSH_BIN web --port $DSH_PORT --no-open
 Restart=always
 RestartSec=3
 StandardOutput=append:$DSH_LOG

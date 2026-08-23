@@ -9,13 +9,15 @@ versionado según [SemVer](https://semver.org/lang/es/).
 
 - `dsh-manage plugins-install [profile]` — instala el stack de ~18 plugins
   homologados (dev/calidad, seguridad, ops, observabilidad) en un profile de
-  dsh (default `web`). Fuente de verdad declarativa en
+  dsh (default `web`), en `$DSH_HOME/profiles/<profile>` (misma ruta que usa
+  el binario `dsh` real). Fuente de verdad declarativa en
   `plugins/manifest.json`; merge-only (nunca overwrite) contra un
   `package.json`/`pnpm-workspace.yaml` ya existente. Prepara `pnpm` con
-  `corepack` si falta, corre `pnpm install --allow-scripts` +
-  `pnpm approve-builds` solo para los addons nativos que lo necesitan
-  (`cpu-features`, `ssh2`, `node-pty`), reinicia dsh y verifica boot real
-  (puerto + grep de errores conocidos en el log).
+  `corepack` si falta, corre `pnpm install` + `pnpm approve-builds` solo
+  para los addons nativos que lo necesitan (`cpu-features`, `ssh2`,
+  `node-pty`), reinicia dsh y verifica boot real: puerto escuchando + grep
+  de errores conocidos en el log + confirmado contra un profile de scratch
+  real que los 18 plugins quedan `"live"` (no solo que el proceso levantó).
 - `dsh-manage service-install` — instala y activa el watchdog systemd
   (`dsh.service`, `Restart=always`) con un `ExecStartPre` defensivo
   (`dsh-autofix.sh`) generado con las rutas reales del puesto. Requiere root.
@@ -32,6 +34,40 @@ versionado según [SemVer](https://semver.org/lang/es/).
 - `plugins/merge-package-json.mjs` y `plugins/merge-pnpm-workspace.py` —
   helpers de merge idempotente usados por `plugins-install`, testeados por
   separado (idempotencia, no pisar un valor customizado a mano).
+
+### Corregido
+
+- **Crítico**: `DSH_HOME` colisionaba entre dos significados — el directorio
+  de trabajo propio de `dsh-manage.sh` (log/pid) y la variable que el
+  binario `dsh` real usa para ubicar `profiles/`. Una primera versión de
+  `plugins-install` inventó `DSH_PROFILES_HOME` para evitar la colisión,
+  pero terminó escribiendo el stack de plugins en un directorio que el
+  proceso `dsh web` real nunca lee — validado end-to-end e inicialmente
+  reportado como "boot OK" cuando en verdad había booteado el profile vacío
+  por defecto. Fix: el directorio de trabajo propio del script se renombró
+  a `DSH_MANAGE_HOME`; `DSH_HOME` pasa a significar únicamente la config
+  real de `dsh` (`$HOME/.dsh` por default, la misma variable que ya exporta
+  el propio harness cuando `dsh-manage` corre desde una sesión de agente
+  DSH). Reverificado end-to-end: package.json real con 20 dependencias,
+  `GET /dsh-market/installed` confirma los 20 plugins en estado `"live"`.
+- `plugins_install()` podía reiniciar por error el `dsh.service` de
+  PRODUCCIÓN de otro `DSH_MANAGE_HOME` en el mismo host — `systemctl
+  is-enabled` solo confirma que el unit existe, no que gestione la instancia
+  correcta. Ahora se compara el `WorkingDirectory` real del unit antes de
+  decidir `systemctl restart` vs `stop`/`start` propios.
+- `pnpm` (a diferencia de `npm`) no tiene flag `--allow-scripts`; el
+  control de scripts nativos se hace vía `pnpm-workspace.yaml`
+  (`allowBuilds`/`strictDepBuilds`) + `pnpm approve-builds`.
+- `start()` nunca pasaba `--port`/`--no-open` al binario `dsh web` pese a
+  documentar `DSH_PORT` como configurable — un puerto distinto de 3080
+  arrancaba igual en el default del profile y `wait_for_port` nunca lo
+  encontraba.
+- `service_install()` no declaraba `Environment=DSH_HOME=...` en el unit de
+  systemd, así que el proceso lanzado por systemd usaría su propio default
+  en vez del `DSH_HOME` configurado.
+- `pnpm-workspace.yaml`: `allowBuilds.better-sqlite3` tenía un placeholder
+  de comentario pegado como valor (`"set this to true or false"`) en vez de
+  `false` — corregido en el manifest.
 
 ## [1.0.0] - 2026-08-22
 
