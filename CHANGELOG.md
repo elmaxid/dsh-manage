@@ -3,7 +3,30 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/),
 versionado según [SemVer](https://semver.org/lang/es/).
 
-## [Unreleased]
+## [1.1.0] - 2026-08-24
+
+### Corregido
+
+- **Distribución**: `install.sh` solo bajaba `dsh-manage.sh` suelto, pero
+  `plugins-install`/`service-install` resuelven `plugins/manifest.json` y los
+  patches por ruta relativa al script — siguiendo el one-liner recomendado,
+  `plugins-install` fallaba con "manifest no encontrado". Ahora `install.sh`
+  clona (o actualiza) el repo completo a `~/.dsh-manage` y deja
+  `$PREFIX/dsh-manage` como symlink al script dentro del clon. Nuevo flag
+  `--clone-dir`. Requiere `git` en el puesto.
+- `dsh-manage.sh`: `DSH_MANAGE_DIR` ahora usa `readlink -f` sobre
+  `BASH_SOURCE` — sin eso, invocar el script vía el symlink de `install.sh`
+  resolvía `plugins/` contra el dir del symlink (`/usr/local/bin`) en vez de
+  contra el repo clonado real (verificado con una prueba mínima; no era solo
+  una hipótesis).
+- **CI**: los tests de `merge-*.{mjs,py}` corren `node` y `python3+pyyaml`
+  directo, pero el workflow no los declaraba — dependía de qué trajera el
+  runner por default. Ahora se fijan explícitamente `actions/setup-node` y
+  `actions/setup-python` + `pip install pyyaml` antes de los tests.
+- README: sección "Requisitos" desactualizada (solo decía `ss` + `npm`) —
+  ahora documenta `git`, `node`, `python3`/`pyyaml`, y `systemctl` para el
+  watchdog. Método "Manual" corregido (clonar + symlink, no `cp` del script
+  suelto).
 
 ### Confirmado en réplica real
 
@@ -35,7 +58,7 @@ versionado según [SemVer](https://semver.org/lang/es/).
 
 ### Agregado
 
-- `dsh-manage plugins-install [profile]` — instala el stack de ~18 plugins
+- `dsh-manage plugins-install [profile]` — instala el stack de ~19 plugins
   homologados (dev/calidad, seguridad, ops, observabilidad) en un profile de
   dsh (default `web`), en `$DSH_HOME/profiles/<profile>` (misma ruta que usa
   el binario `dsh` real). Fuente de verdad declarativa en

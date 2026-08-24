@@ -154,27 +154,38 @@ no hay que mezclarlos.
 - **Correr como el usuario que posee el proceso de DSH** (normalmente `root`):
   la detección de PID usa `ss -ltnp`, que solo expone los pids de los sockets
   sobre los que se tienen permisos.
+- Para el flujo completo (`plugins-install`): **`git`**, **`node`** y
+  **`python3` con `pyyaml`** en el puesto (o que `install` los bootstrapee —
+  `node` lo trae `dsh-manage install` vía `corepack`; `python3`/`pyyaml` los
+  usa el helper `plugins/merge-pnpm-workspace.py`). Si querés el watchdog
+  systemd, además **`systemctl`** (systemd) y permiso root.
 
 ## Instalación
 
 ### One-liner (recomendado para puestos dev)
 
-Baja `dsh-manage.sh` del repo y lo deja en `/usr/local/bin/dsh-manage`:
+Clona el repo completo a `~/.dsh-manage` y deja `/usr/local/bin/dsh-manage`
+como symlink al script dentro del clon. El repo completo es necesario: los
+comandos `plugins-install`/`service-install` resuelven `plugins/manifest.json`
+y los patches por ruta relativa al script — un `dsh-manage.sh` suelto (sin
+la carpeta `plugins/` al lado) no puede instalarlos.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/elmaxid/dsh-manage/main/install.sh | bash
 ```
 
-El instalador muestra el plan, verifica que lo bajado sea un script bash válido
-(shebang) y pide confirmación antes de instalar. Opciones:
+El instalador muestra el plan y pide confirmación antes de instalar.
+Idempotente: si el clon ya existe, lo actualiza con `git pull` en vez de
+clonar de nuevo. Opciones:
 
-| Flag              | Qué hace                                            |
-|-------------------|-----------------------------------------------------|
-| `-y, --yes`       | No pedir confirmación                               |
-| `-v, --verbose`   | Mostrar cada paso en detalle                         |
-| `--prefix <dir>`  | Dir de instalación (default `/usr/local/bin`)       |
-| `--ref <git-ref>` | Versión/branch/tag a bajar (default `main`)         |
-| `--no-color`      | Desactivar colores                                   |
+| Flag                  | Qué hace                                            |
+|-----------------------|-----------------------------------------------------|
+| `-y, --yes`           | No pedir confirmación                               |
+| `-v, --verbose`       | Mostrar cada paso en detalle                         |
+| `--prefix <dir>`      | Dir del symlink ejecutable (default `/usr/local/bin`) |
+| `--clone-dir <dir>`   | Dir del repo clonado (default `~/.dsh-manage`)       |
+| `--ref <git-ref>`     | Versión/branch/tag a bajar (default `main`)         |
+| `--no-color`          | Desactivar colores                                   |
 
 ```bash
 # silencioso para automatizar
@@ -191,12 +202,15 @@ bash install.sh
 
 ### Manual
 
+Requerís el repo completo (no solo el script) para que `plugins-install` /
+`service-install` encuentren `plugins/`. Cloná y symlinkeá:
+
 ```bash
-sudo cp dsh-manage.sh /usr/local/bin/dsh-manage
-sudo chmod +x /usr/local/bin/dsh-manage
+git clone https://github.com/elmaxid/dsh-manage.git ~/.dsh-manage
+sudo ln -sf ~/.dsh-manage/dsh-manage.sh /usr/local/bin/dsh-manage
 ```
 
-Alternativamente, operar directo desde el repo: `./dsh-manage.sh <comando>`.
+Alternativamente, operar directo desde el clon: `./dsh-manage.sh <comando>`.
 
 ## Configuración
 

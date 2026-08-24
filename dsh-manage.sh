@@ -39,7 +39,7 @@ set -euo pipefail
 # Versión del propio script de gestión (no la de @deepseek-ai/dsh — esa es
 # installed_version/latest_version más abajo). Semver, sin 'v'; el CLI la
 # imprime con 'v' delante. Ver CHANGELOG.md por release.
-DSH_MANAGE_VERSION="1.0.0"
+DSH_MANAGE_VERSION="1.1.0"
 
 DSH_NODE="${DSH_NODE:-$HOME/.local/dsh-node/node24/bin}"
 # Directorio de trabajo/log/pid DE ESTE SCRIPT — NO confundir con DSH_HOME,
@@ -76,7 +76,12 @@ DSH_NPM_CACHE="${DSH_NPM_CACHE:-$DSH_MANAGE_HOME/.npm-cache}"
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 # Directorio del propio script (para resolver plugins/manifest.json relativo
 # al repo, sin depender del cwd desde donde se invoque dsh-manage).
-DSH_MANAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# readlink -f resuelve symlinks: si dsh-manage se invoca vía un symlink en
+# $PATH (ej. /usr/local/bin/dsh-manage -> el repo clonado, que es lo que
+# instala install.sh), dirname "${BASH_SOURCE[0]}" a secas devolvería el
+# directorio del symlink (/usr/local/bin), no el del repo real donde vive
+# plugins/ — confirmado con una prueba mínima, no era solo una hipótesis.
+DSH_MANAGE_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 DSH_MANIFEST="${DSH_MANIFEST:-$DSH_MANAGE_DIR/plugins/manifest.json}"
 DSH_SERVICE_USER="${DSH_SERVICE_USER:-$(id -un)}"
 

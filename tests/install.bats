@@ -22,3 +22,14 @@
   [ "$status" -ne 0 ]
   [[ "$output" == *"--prefix requiere un valor"* ]]
 }
+@test "install.sh --help menciona --clone-dir" {
+  run bash "$BATS_TEST_DIRNAME/../install.sh" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--clone-dir"* ]]
+}
+
+@test "install.sh --clone-dir sin valor falla" {
+  run bash "$BATS_TEST_DIRNAME/../install.sh" --clone-dir
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--clone-dir requiere un valor"* ]]
+}

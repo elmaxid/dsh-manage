@@ -2,9 +2,14 @@
 #
 # install.sh — instalador de dsh-manage para puestos de desarrollo.
 #
-# Baja dsh-manage.sh del repo de GitHub y lo deja en $PREFIX (default
-# /usr/local/bin/dsh-manage) con permisos de ejecución. No instala DSH en sí:
-# eso lo hace después `dsh-manage install`.
+# Clona (o actualiza) el repo completo en $CLONE_DIR (default ~/.dsh-manage)
+# y deja $PREFIX/dsh-manage (default /usr/local/bin/dsh-manage) como symlink
+# al script principal dentro del clon. El repo completo hace falta de
+# verdad: `dsh-manage plugins-install` resuelve plugins/manifest.json y los
+# patches por ruta relativa al propio script — bajar solo dsh-manage.sh
+# suelto (como hacía una versión anterior de este instalador) deja
+# plugins-install sin encontrar el manifest. No instala DSH en sí: eso lo
+# hace después `dsh-manage install`.
 #
 # Uso (one-liner):
 #   curl -fsSL https://raw.githubusercontent.com/elmaxid/dsh-manage/main/install.sh | bash
@@ -17,7 +22,8 @@
 # Opciones:
 #   -y, --yes        no preguntar confirmación (asume sí)
 #   -v, --verbose    mostrar cada paso en detalle
-#   --prefix <dir>   dir de instalación (default: /usr/local/bin)
+#   --prefix <dir>   dir del symlink ejecutable (default: /usr/local/bin)
+#   --clone-dir <dir> dir del repo clonado (default: ~/.dsh-manage)
 #   --ref <git-ref>  versión/branch/tag a bajar (default: main)
 #   --no-color       desactivar colores
 #   -h, --help       esta ayuda
@@ -25,9 +31,9 @@
 set -euo pipefail
 
 REPO="elmaxid/dsh-manage"
-RAW_BASE="https://raw.githubusercontent.com/${REPO}"
-SCRIPT_NAME="dsh-manage.sh"
+REPO_URL="https://github.com/${REPO}.git"
 PREFIX="/usr/local/bin"
+CLONE_DIR="${HOME}/.dsh-manage"
 REF="main"
 YES=0
 VERBOSE=0
@@ -69,7 +75,8 @@ show_help() {
 Opciones:
   -y, --yes        no preguntar confirmación
   -v, --verbose    mostrar cada paso en detalle
-  --prefix <dir>   dir de instalación (default: /usr/local/bin)
+  --prefix <dir>   dir del symlink ejecutable (default: /usr/local/bin)
+  --clone-dir <dir> dir del repo clonado (default: ~/.dsh-manage)
   --ref <git-ref>  versión/branch/tag a bajar (default: main)
   --no-color       desactivar colores
   -h, --help       esta ayuda
@@ -82,6 +89,7 @@ parse_args() {
       -y|--yes)    YES=1; shift ;;
       -v|--verbose)VERBOSE=1; shift ;;
       --prefix)    PREFIX="${2:-}"; [ -n "$PREFIX" ] || die "--prefix requiere un valor"; shift 2 ;;
+      --clone-dir) CLONE_DIR="${2:-}"; [ -n "$CLONE_DIR" ] || die "--clone-dir requiere un valor"; shift 2 ;;
       --ref)       REF="${2:-}";    [ -n "$REF" ]    || die "--ref requiere un valor"; shift 2 ;;
       --no-color)  NO_COLOR=1; shift ;;
       -h|--help)   show_help; exit 0 ;;
@@ -124,15 +132,14 @@ maybe_sudo() {
 banner() {
   printf '\n'
   printf '%s%sdsh-manage — instalador%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-  printf '%sBaja el script dsh-manage.sh del repo %s y lo instala%s\n' "$C_DIM" "$REPO" "$C_RESET"
+  printf '%sClona el repo %s y deja dsh-manage en %s%s\n' "$C_DIM" "$REPO" "$PREFIX" "$C_RESET"
   printf '%sNO instala DSH en sí; eso lo hacés después con: dsh-manage install%s\n\n' "$C_DIM" "$C_RESET"
 }
 
 plan() {
   printf '%sPlan:%s\n' "$C_BOLD" "$C_RESET"
-  printf '  1. Bajar %s/%s/%s\n' "$RAW_BASE" "$REF" "$SCRIPT_NAME"
-  printf '  2. Verificar que es un script bash válido\n'
-  printf '  3. Instalar en %s%s/dsh-manage%s (permisos 755)\n' "$C_BOLD" "$PREFIX" "$C_RESET"
+  printf '  1. Clonar (o actualizar) %s%s%s\n' "$C_BOLD" "$CLONE_DIR" "$C_RESET"
+  printf '  2. Dejar %s%s/dsh-manage%s como symlink a %s/dsh-manage.sh\n' "$C_BOLD" "$PREFIX" "$C_RESET" "$CLONE_DIR"
   printf '\n'
 }
 
@@ -150,34 +157,48 @@ confirm() {
   esac
 }
 
-fetch_script() {
-  local url="$RAW_BASE/$REF/$SCRIPT_NAME"
-  info "bajando $url"
-  verbose "ejecutando: $FETCH \"$url\""
-  content=$($FETCH "$url") || die "no se pudo bajar $url"
-  [ -n "$content" ] || die "la respuesta vino vacía (¿ref incorrecto?: $REF)"
-  # Sanity: debe empezar con shebang bash. Evita instalar algo que no es el script.
-  case "$content" in
-    "#!/usr/bin/env bash"*) : ;;
-    *) die "el contenido bajado no empieza con shebang bash — abortando por seguridad" ;;
-  esac
-  verbose "descargado $(printf '%s' "$content" | wc -l) líneas, shebang OK"
+# Detección de herramientas: además de curl/wget (para el one-liner que nos
+# baja) necesitamos git (para clonar el repo completo).
+have_git() {
+  if ! have git; then
+    die "necesito git para clonar el repo completo de dsh-manage"
+  fi
+}
+
+clone_or_update() {
+  if [ -d "$CLONE_DIR/.git" ]; then
+    info "repo ya existe en $CLONE_DIR — actualizando a ref $REF..."
+    (cd "$CLONE_DIR" && git fetch --quiet --tags origin && git checkout --quiet "$REF" && git pull --quiet --ff-only origin "$REF") \
+      || die "no se pudo actualizar $CLONE_DIR"
+    ok "actualizado a $REF"
+  else
+    info "clonando $REPO en $CLONE_DIR..."
+    verbose "ejecutando: git clone --quiet $REPO_URL $CLONE_DIR"
+    git clone --quiet "$REPO_URL" "$CLONE_DIR" || die "no se pudo clonar $REPO_URL"
+    if [ "$REF" != "main" ]; then
+      (cd "$CLONE_DIR" && git checkout --quiet "$REF") || die "ref $REF no existe"
+    fi
+    ok "clonado en $CLONE_DIR"
+  fi
 }
 
 install_script() {
+  local src="$CLONE_DIR/dsh-manage.sh"
   local dest="$PREFIX/dsh-manage"
-  info "instalando en $dest"
-  verbose "escribiendo contenido con $SUDO"
-  printf '%s\n' "$content" | $SUDO tee "$dest" >/dev/null
-  $SUDO chmod 755 "$dest"
+  [ -f "$src" ] || die "el clon no contiene dsh-manage.sh (¿está en $REF?)"
+  info "symlink: $dest -> $src"
+  verbose "ejecutando: $SUDO ln -sf $src $dest"
+  $SUDO ln -sf "$src" "$dest"
+  $SUDO chmod 755 "$src"
   ok "instalado: $dest"
 }
 
 next_steps() {
-  printf '\n%sListo.%s Para empezar:\n' "$C_GREEN" "$C_RESET"
-  printf '  %sdsh-manage install%s   # instala @deepseek-ai/dsh\n' "$C_BOLD" "$C_RESET"
-  printf '  %sdsh-manage start%s     # arranca el servidor\n' "$C_BOLD" "$C_RESET"
-  printf '  %sdsh-manage status%s    # ver estado + update disponible\n' "$C_BOLD" "$C_RESET"
+  printf '\n%sListo.%s Para empezar (con el repo completo ya disponible):\n' "$C_GREEN" "$C_RESET"
+  printf '  %sdsh-manage install%s            # instala @deepseek-ai/dsh\n' "$C_BOLD" "$C_RESET"
+  printf '  %sdsh-manage plugins-install%s    # stack de ~19 plugins homologado\n' "$C_BOLD" "$C_RESET"
+  printf '  %sdsh-manage service-install%s    # watchdog systemd\n' "$C_BOLD" "$C_RESET"
+  printf '  %sdsh-manage status%s             # ver estado + update disponible\n' "$C_BOLD" "$C_RESET"
   printf '\n'
 }
 
@@ -187,9 +208,10 @@ main() {
   banner
   plan
   pick_fetcher
+  have_git
   maybe_sudo
   confirm
-  fetch_script
+  clone_or_update
   install_script
   next_steps
 }

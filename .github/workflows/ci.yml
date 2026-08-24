@@ -19,6 +19,20 @@ jobs:
         with:
           additional_files: dsh-manage.sh
 
+      # Los tests de merge-package-json.mjs/merge-pnpm-workspace.py corren
+      # node y python3+pyyaml directo (no via dsh-manage.sh) — declarados
+      # explícitos acá para no depender de qué traiga el runner por default.
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Python (pyyaml para merge-pnpm-workspace.py)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+
       - name: Batería de tests (bats-core)
         uses: bats-core/bats-action@2.0.0
 
