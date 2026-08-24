@@ -5,6 +5,20 @@ versionado según [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Confirmado en réplica real
+
+- El fix de shadowing de `dsh-tools`/`cosmokit`/`dsh-fs` en `dsh-autofix.sh`
+  (`service-install`) **es necesario, no solo defensa en profundidad**: se
+  había anotado como "probablemente ya no hace falta" desde que
+  `pnpm-workspace.yaml` trae `autoInstallPeers:false`. Reapareció en la
+  primera réplica real en otro puesto — que YA tenía `autoInstallPeers:false`
+  desde antes — inmediatamente después de `plugins-install`, rompiendo el
+  tool runtime (`Cannot read properties of undefined (reading 'prepare')`).
+  Reparado a mano con el mismo `rm -rf` que ya hace el script. **Corré
+  `service-install` justo después de `plugins-install`, no como paso
+  opcional postergable** — así el fix se aplica solo en el próximo boot en
+  vez de requerir intervención manual si el bug reaparece.
+
 ### Agregado
 
 - `dsh-manage plugins-install [profile]` — instala el stack de ~18 plugins

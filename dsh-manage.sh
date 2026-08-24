@@ -384,13 +384,15 @@ plugins_install() {
 # regresiones conocidas de pnpm en cada boot, sin fallar nunca el arranque.
 # Idempotente: pisa el unit/script con la config actual y hace daemon-reload.
 #
-# El fix de shadowing de @deepseek-ai/{dsh-tools,cosmokit,dsh-fs} local en
-# dsh-autofix.sh probablemente ya no hace falta desde que
-# pnpm-workspace.yaml trae autoInstallPeers:false (causa raíz real) — se
-# mantiene como defensa en profundidad porque es un no-op inofensivo cuando
-# no aplica. El fix de schema de dsh-plugin-verify tampoco debería hacer
-# falta ya que el pnpm patch lo resuelve de forma persistente, pero por el
-# mismo motivo (no-op si no aplica) se deja como red de seguridad.
+# CONFIRMADO NECESARIO (no solo defensa en profundidad especulativa): el fix
+# de shadowing de @deepseek-ai/{dsh-tools,cosmokit,dsh-fs} local reapareció
+# en una réplica real en otro host que YA tenía autoInstallPeers:false desde
+# antes de correr plugins-install — ese ajuste NO es garantía suficiente por
+# sí solo, sigue haciendo falta este fix. Causó "Cannot read properties of
+# undefined (reading 'prepare')" (tool runtime roto) inmediatamente después
+# de plugins-install, reparado a mano con el mismo rm -rf que hace este
+# script — evidencia de que corre service-install justo después de
+# plugins-install (no como paso opcional postergable) evita este bloqueo.
 service_install() {
   local unit_path="/etc/systemd/system/dsh.service"
   local autofix_path="$DSH_MANAGE_HOME/dsh-autofix.sh"

@@ -43,6 +43,36 @@ dsh-manage service-install    # watchdog systemd, deja dsh siempre arriba
 Tres pasos, cada uno idempotente y re-ejecutable solo si el anterior falla —
 no hace falta reintentar todo desde cero.
 
+> ⚠️ **Corré `service-install` justo después de `plugins-install`, no lo
+> postergues**: el `ExecStartPre` que instala repara una regresión conocida
+> de pnpm (shadowing de `@deepseek-ai/{dsh-tools,cosmokit,dsh-fs}`) que
+> puede romper el tool runtime justo después de instalar el stack de
+> plugins — confirmado en una réplica real, ver CHANGELOG. Sin
+> `service-install` todavía puesto, si el bug aparece hay que repararlo a
+> mano (`rm -rf` de esas 3 carpetas bajo
+> `$DSH_HOME/profiles/<profile>/node_modules/@deepseek-ai/` + reiniciar).
+
+### Instalación sobre un puesto que ya tenía `dsh` a mano
+
+Si el server destino ya tiene `dsh`/`node` instalados en otra ruta (por
+ejemplo un paquete del sistema en `/usr/bin`, no la tree aislada de
+`node24`), apuntá `DSH_NODE` a esa ruta real **antes** de cada comando para
+que `dsh-manage` gestione la instalación existente en vez de armar una
+paralela:
+
+```bash
+export DSH_NODE=/usr/bin      # o donde vivan los binarios node/dsh reales
+dsh-manage plugins-install
+dsh-manage service-install
+```
+
+`plugins-install` es seguro de correr sobre un profile con plugins ya
+instalados a mano: el merge nunca pisa una dependencia existente, solo
+agrega lo que falte del manifest. `service-install` sí **sobreescribe sin
+preguntar** un `/etc/systemd/system/dsh.service` previo — si ya tenías uno
+propio (no creado por `dsh-manage`), hacé un backup manual antes
+(`cp /etc/systemd/system/dsh.service /etc/systemd/system/dsh.service.bak`).
+
 ### `check-update` y `status`
 
 `check-update` consulta el registry de npm y dice si hay una versión más nueva:
