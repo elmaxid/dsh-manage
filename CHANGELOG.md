@@ -18,6 +18,20 @@ versionado según [SemVer](https://semver.org/lang/es/).
   `service-install` justo después de `plugins-install`, no como paso
   opcional postergable** — así el fix se aplica solo en el próximo boot en
   vez de requerir intervención manual si el bug reaparece.
+- Confirmado además: el bug de shadowing no es exclusivo de
+  `plugins-install` — también lo dispara `dsh plugin add` (CLI estándar),
+  en cualquier instalación de plugin. Reforzado el mismo día instalando
+  `@linxin666/dsh-client-ui-skill-explorer` vía CLI en un host que ya tenía
+  `service-install` activo: el shadowing reapareció pero el `ExecStartPre`
+  lo limpió solo en el siguiente `systemctl restart`, sin intervención.
+
+### Agregado (plugin nuevo)
+
+- `@linxin666/dsh-client-ui-skill-explorer` sumado al stack homologado
+  (`plugins/manifest.json`) — panel GUI para browsear/activar/desactivar/
+  crear/borrar skills por fuente (bundled/project/user/custom/runtime).
+  Auditado con `plugin_vet` antes de instalar: PASS 87/100, mismo autor
+  (`linxin666`/`dsh-web-ui`) ya auditado con `dsh-ssh` y `dsh-git-graph`.
 
 ### Agregado
 

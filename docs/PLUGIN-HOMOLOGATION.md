@@ -47,7 +47,7 @@ extrae en `$DSH_PREFIX`, mismo layout que una instalación manual. Idempotente
 - ❌ **FALLA** — probado y revertido; motivo documentado.
 - ⏳ **PENDIENTE** — seleccionado, todavía no probado.
 
-## Progreso: 22 de ~28 probados (21 limpios + 1 con hotfix), 1 incompatible documentado (dsh-TUI), 4 descartados (dsh-mask, Aegis, dsh-update-checker, dsh-cloud-sync), 1 revertido por precaución (dsh-permission-rules — ver hallazgo abajo). **Ops cerrado. Memoria cerrada. Observabilidad & salud: 4/7 instalados (dsh-context sumado), 1 descartado, 3 opcionales. Extra cerrado (2/2).**
+## Progreso: 23 de ~29 probados (22 limpios + 1 con hotfix), 1 incompatible documentado (dsh-TUI), 4 descartados (dsh-mask, Aegis, dsh-update-checker, dsh-cloud-sync), 1 revertido por precaución (dsh-permission-rules — ver hallazgo abajo). **Ops cerrado. Memoria cerrada. Observabilidad & salud: 4/7 instalados (dsh-context sumado), 1 descartado, 3 opcionales. Extra cerrado (2/2). Núcleo: +dsh-skill-explorer (24/08, post-cierre del stack, ver tabla).**
 
 **Stack considerado completo por el usuario** tras esta tanda (dsh-context + dsh-chat-recovery). Pendientes reales que quedan, todos de baja prioridad/opcionales: Workflow (dsh-task-board/dsh-solo-thinking/dsh-github, nunca evaluados), dsh-code-check (vía github:, no npm), dsh-observe/dsh-fast/dsh-budget (métricas/costo, opcionales), dsh-doublecheck en estado `restart` (activa en el próximo reinicio, no urgente).
 
@@ -122,6 +122,7 @@ de DSH que corre acá. Sin acción pendiente; documentado para no reinvestigar.
 |---|---|---|---|
 | dsh-market | `dshmarket` | ✅ OK | App store de plugins. |
 | dsh-plugin-manager | `@linxin666/dsh-client-ui-plugin-manager` | ✅ OK | Gestor visual. |
+| dsh-skill-explorer | `@linxin666/dsh-client-ui-skill-explorer` | ✅ OK | Instalado 24/08 vía `dsh plugin --profile web add ...` (CLI, no Market UI). Auditado antes con `plugin_vet`: PASS 87/100 (sin scripts install, sin red sospechosa, sin payloads; mismo autor `linxin666`/`dsh-web-ui` ya auditado con `dsh-ssh`/`dsh-git-graph`). Panel GUI: browsear/activar/desactivar/crear/borrar skills por fuente (bundled/project/user/custom/runtime). **Confirmó un hallazgo nuevo sobre el bug de shadowing** (ver `dsh-plugin-verify` abajo): también lo dispara `dsh plugin add` por CLI, no solo `dsh-manage plugins-install` — no es exclusivo de ese comando nuevo. Quedó en `state: "restart"` (no hot-mount) tras el `add`; `systemctl restart dsh.service` disparó el `ExecStartPre` (`dsh-autofix.sh`) que limpió el shadowing solo y activó el plugin en caliente — funcionó tal como está diseñado, sin intervención manual. |
 | dsh-better-sidebar | `dsh-better-sidebar` | ✅ OK | Requirió aprobar build nativo de `node-pty` (`pnpm approve-builds node-pty`). |
 | dsh-TUI | `@deepseek-harness-tui/dsh-tui` | ❌ FALLA | **No instalar en el profile `web`.** Trae su propio `@dsh-std/storage` empaquetado → colisiona con `id: storage` que ya registra `dsh-base`/`dsh-web-app` → `duplicate loader entry id: storage`, boot no abre el puerto. Es una herramienta de terminal standalone: se instala en su **propio profile** (`dsh plugin --profile dsh-tui add ...`), nunca junto a los plugins de `web`. |
 

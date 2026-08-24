@@ -36,7 +36,7 @@ dsh-manage stop
 
 ```bash
 dsh-manage install            # bootstrap de Node (si falta) + @deepseek-ai/dsh
-dsh-manage plugins-install    # stack de ~18 plugins homologado (profile 'web')
+dsh-manage plugins-install    # stack de ~19 plugins homologado (profile 'web')
 dsh-manage service-install    # watchdog systemd, deja dsh siempre arriba
 ```
 
@@ -89,7 +89,7 @@ corre: dsh-manage update
 
 ### `plugins-install`: el stack de plugins homologado
 
-Instala en el profile indicado (default `web`) el conjunto de ~18 plugins
+Instala en el profile indicado (default `web`) el conjunto de ~19 plugins
 comunitarios evaluados uno por uno en un puesto real — boot limpio
 verificado, sin colisiones de `id`, sin texto de usuario en chino sin
 traducir. La lista completa y el detalle de cada evaluación están en
