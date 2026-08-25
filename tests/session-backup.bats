@@ -363,3 +363,22 @@ assert len(v['baseline'])==48, v
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup verify --from "$(basename "$snap")"
   [ "$status" -ne 0 ]
 }
+
+@test "list no duplica el snapshot apuntado por latest" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-dup--" "session-dup" "session-dup" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label unico
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup list
+  [ "$status" -eq 0 ]
+  # debe aparecer UNA sola vez el label, no dos (una por el dir real, otra por 'latest')
+  count="$(printf '%s\n' "$output" | grep -c "unico")"
+  [ "$count" -eq 1 ]
+}
+
+@test "create rechaza un label con newline embebido" {
+  install_fake_harness 48
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label $'ok\n../../tmp/evil'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"label"* ]]
+}

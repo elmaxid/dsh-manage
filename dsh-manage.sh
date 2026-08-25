@@ -587,8 +587,11 @@ session_backup_create() {
     esac
   done
 
-  # El label entra en una ruta: sin validar, '../../x' escapa del backup root.
-  if ! printf '%s' "$label" | grep -qE '^[A-Za-z0-9._-]+$'; then
+  # El label entra en una ruta: sin validar, '../../x' escape del backup root.
+  # grep (sin -z) procesa linea por linea: un label con newline embebido como
+  # $'ok\n../../tmp/evil' pasa si UNA linea coincide (ok), aunque el resto no.
+  # El regex nativo de bash (no multilinea) valida toda la string de una vez.
+  if [[ ! "$label" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "label invalido: solo se permiten [A-Za-z0-9._-]" >&2
     return 1
   fi
@@ -697,6 +700,10 @@ session_backup_list() {
   local found=0 partials=0 dir
   for dir in "$DSH_BACKUP_ROOT"/*/; do
     [ -d "$dir" ] || continue
+    # latest es un symlink al snapshot mas reciente: el glob */ lo expande
+    # como una entrada mas (indistinguible de un dir real para [ -d ]), lo
+    # que duplica ese snapshot en la salida. Saltearlo explicitamente.
+    case "${dir%/}" in */latest) continue ;; esac
     case "$dir" in *.partial/) partials=$((partials + 1)); continue ;; esac
     [ -f "${dir}MANIFEST.json" ] || continue
     found=$((found + 1))
