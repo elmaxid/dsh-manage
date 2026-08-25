@@ -382,3 +382,17 @@ assert len(v['baseline'])==48, v
   [ "$status" -ne 0 ]
   [[ "$output" == *"label"* ]]
 }
+
+@test "el manifest documenta los plugins que escriben eventos de sesion" {
+  run python3 - "$BATS_TEST_DIRNAME/../plugins/manifest.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+w = m.get("sessionEventWriters")
+assert w, "falta la clave sessionEventWriters"
+sp = w.get("dsh-swarm-panel")
+assert sp, "dsh-swarm-panel no esta declarado como event writer"
+assert "swarm/" in sp.get("prefixes", []), sp
+assert "harness" in sp.get("note", "").lower(), "la nota debe aclarar que el fix es del harness"
+PY
+  [ "$status" -eq 0 ]
+}
