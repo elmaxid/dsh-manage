@@ -2,7 +2,12 @@
 dsh.log
 dsh.pid
 .ledger/
+.superpowers/
 
 # Editor / OS
 .DS_Store
 *.swp
+
+# Python
+__pycache__/
+*.pyc

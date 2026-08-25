@@ -15,6 +15,7 @@ instalación de DSH aislada en la tree de `node24` del usuario.
 | `install`                    | Instala `@deepseek-ai/dsh` globalmente en la tree de `node24`            |
 | `plugins-install [profile]`  | Instala el stack de plugins homologado (dev/seguridad/ops) en un profile — default `web` |
 | `service-install`            | Instala el watchdog systemd (`dsh.service`, `Restart=always`) — requiere root |
+| `session-backup {scan,create,list,verify}` | Resguardo de sesiones: clasifica riesgo y crea snapshots verificables |
 | `start`                      | Arranca el servidor web si no está escuchando ya (idempotente)           |
 | `stop`                       | Detiene el proceso que escucha el puerto                                  |
 | `update`                     | `uninstall` + `install` limpio de la última versión y lo deja corriendo   |
@@ -148,6 +149,43 @@ Una vez activo, usar `systemctl {status,stop,restart} dsh.service` en vez
 de `dsh-manage {start,stop}` — ambos mecanismos gestionan el mismo puerto y
 no hay que mezclarlos.
 
+### `session-backup`: resguardo de sesiones
+
+Algunos plugins (`dsh-swarm-panel` y otros *event-writers*) registran tipos de
+evento propios en el harness **mientras están cargados**. Si se desinstalan, las
+sesiones que usaron esos eventos dejan de cargar
+(`SessionFormatUnsupportedError`). Pasó de verdad en este proyecto.
+
+```bash
+dsh-manage session-backup scan       # ¿qué sesiones están en riesgo?
+dsh-manage session-backup create --only-at-risk --label pre-cambios
+dsh-manage session-backup list
+dsh-manage session-backup verify --from latest
+```
+
+| Clase | Significado |
+|---|---|
+| `ok` | Solo tipos first-party. Inmune a instalar/desinstalar plugins. |
+| `at-risk` | Tiene tipos de un plugin **instalado**. Carga hoy; se rompe si lo desinstalás. |
+| `broken` | Tiene tipos que ningún plugin instalado declara. Ya no carga. |
+
+`scan`, `create`, `list` y `verify` **nunca escriben bajo `sessions/`**. Los
+snapshots viven en `$DSH_HOME/session-backups/` (hermano de `sessions/`), con
+`MANIFEST.json`, `CHECKSUMS.sha256` y `vocabulary.json` — verificables con
+`sha256sum -c` sin necesitar este script.
+
+> ⚠️ **Esto da visibilidad y copias, no inmunidad.** Nada impide todavía un
+> `plugin remove` que rompa sesiones (eso es la Fase 4 del diseño), y los eventos
+> ya escritos siguen sin marcar porque **el harness `0.1.1-rc.2` descarta el flag
+> `ignorable`** — no es algo que se arregle desde un plugin. Hasta que salga una
+> release del harness que lo propague, la recuperación de una sesión rota es:
+> reinstalar el plugin que declaraba esos tipos.
+
+> ⚠️ **Si restaurás un log a mano con `cp`, detené DSH primero**
+> (`systemctl stop dsh.service`). El proceso vivo mantiene un descriptor abierto
+> en modo append: reemplazar el archivo por debajo hace que la restauración se
+> pierda en silencio.
+
 ## Requisitos
 
 - **Linux** con `ss` (iproute2) y `npm`.
@@ -221,6 +259,7 @@ Todo tiene defaults razonables y se overridea por variables de entorno:
 | `DSH_NODE`          | `$HOME/.local/dsh-node/node24/bin`     | Dir de los binarios node/npm/dsh        |
 | `DSH_MANAGE_HOME`   | `$HOME/dsh-test`                       | Dir de trabajo, log y pidfile **de este script** |
 | `DSH_HOME`          | `$HOME/.dsh`                           | Config real del binario `dsh` (profiles, `cordis.patch.yml`) — **no confundir con `DSH_MANAGE_HOME`** |
+| `DSH_BACKUP_ROOT`   | `$DSH_HOME/session-backups`            | Raíz de los snapshots de sesión           |
 | `DSH_PORT`          | `3080`                                 | Puerto donde escucha DSH                |
 | `DSH_START_TIMEOUT` | `180`                                  | Segundos a esperar por el puerto        |
 | `DSH_ALLOW_SCRIPTS` | lista de addons nativos de dsh          | Paquetes a los que npm permite scripts  |

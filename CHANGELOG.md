@@ -3,6 +3,35 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/),
 versionado según [SemVer](https://semver.org/lang/es/).
 
+## [Unreleased]
+
+### Agregado
+
+- `dsh-manage session-backup {scan,create,list,verify}` — resguardo de sesiones
+  ante plugins que escriben eventos propios. `scan` clasifica cada sesión en
+  `ok`/`at-risk`/`broken` extrayendo el catálogo de tipos del harness instalado
+  (48 tipos hoy, con piso de cordura de 20 para no clasificar todo como roto si
+  el parseo falla). `create` produce snapshots atómicos verificables
+  (`MANIFEST.json` + `CHECKSUMS.sha256` + `vocabulary.json`), fuera de
+  `sessions/`. Ninguno de estos subcomandos escribe bajo `sessions/`. Diseño en
+  `docs/SESSION-BACKUP-DESIGN.md`.
+- `plugins/known-session-event-types.json` — baseline vendorizado; `scan` avisa
+  si el catálogo del harness cambió respecto de él.
+- `plugins/manifest.json`: clave `sessionEventWriters`, que documenta qué
+  paquetes escriben eventos de sesión y por qué el problema **no** se puede
+  arreglar parcheando el plugin.
+
+### Notas
+
+- **`Session.append()` descarta el flag `ignorable`** en `dsh-session@0.1.1-rc.2`
+  (verificado en `lib/index.js:1444`). Por eso los eventos de plugins nacen sin
+  marcar y una sesión que los contiene deja de cargar al desinstalar el plugin.
+  El fix existe solo en master del harness. Mientras tanto, `session-backup`
+  aporta **visibilidad y copias verificables, no inmunidad**.
+- Las filas `text-chunks`/`reasoning-chunks`/`tool-call-chunks` del log son
+  **filas de almacenamiento**, no eventos: se expanden a `assistant/chunk` antes
+  del chequeo de tipos. Contarlas como eventos clasificaba mal 55 de 71 sesiones.
+
 ## [1.1.0] - 2026-08-24
 
 ### Corregido
