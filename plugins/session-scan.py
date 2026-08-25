@@ -78,6 +78,189 @@ def cmd_baseline(args):
     print()
 
 
+# Tags de FILA DE ALMACENAMIENTO, no de evento. El backend jsonl empaqueta
+# rafagas de chunks con packChunkRuns y las expande con decodeStorageRecord a
+# eventos `assistant/chunk` ANTES del chequeo de tipos. Si se cuentan como
+# eventos, una sesion sana se clasifica como rota (paso: 60 de 71 falsos).
+CHUNK_ROW_TAGS = {"text-chunks", "reasoning-chunks", "tool-call-chunks"}
+
+# El tipo al que expanden las filas de chunk (esta en el baseline first-party).
+CHUNK_EVENT_TYPE = "assistant/chunk"
+
+# Vocabulario: solo literales que el plugin realmente PERSISTE via append(...).
+# Un regex laxo tambien capturaria los de ctx.on(...) y produce duenos falsos.
+APPEND_LITERAL = re.compile(r'append\(\s*"([a-z][a-z0-9-]*/[a-z0-9/-]+)"')
+VOCAB_MARKER = "KNOWN_SESSION_EVENT_TYPES"
+NODE_MODULES_SKIP = {".bin", ".pnpm", ".pnpm_patches", ".modules.yaml"}
+
+
+def decode_storage_row(row):
+    """Expande una fila de almacenamiento a sus eventos; el resto pasa igual.
+
+    Espeja `decodeStorageRecord` del harness: solo los tres tags de chunk son
+    filas. Para clasificar alcanza con el `type` resultante y la cantidad.
+    """
+    if row.get("type") not in CHUNK_ROW_TAGS:
+        return [row]
+    data = row.get("data") or {}
+    members = data.get("args") if row["type"] == "tool-call-chunks" else data.get("texts")
+    count = len(members) if isinstance(members, list) else 0
+    return [{"type": CHUNK_EVENT_TYPE} for _ in range(count)]
+
+
+def read_session_events(artifact):
+    """Devuelve (header, eventos, torn) de un log .zstd o .jsonl plano.
+
+    No usa check=True a proposito: un log con cola rota sale rc!=0 pero emite
+    los datos validos, y el spec (§5.2) dice que sigue siendo restaurable.
+    """
+    torn = False
+    if artifact.endswith(".zstd"):
+        proc = subprocess.run(["zstd", "-dc", artifact], capture_output=True)
+        raw = proc.stdout.decode("utf-8", errors="replace")
+        torn = proc.returncode != 0
+    else:
+        with open(artifact, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    header, events = None, []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            torn = True   # cola rota a mitad de linea
+            continue
+        if header is None and row.get("type") == "session":
+            header = row
+            continue
+        events.extend(decode_storage_row(row))
+    return header, events, torn
+
+
+def _scan_pkg(pkg_dir, owners):
+    """Registra el vocabulario que declara un paquete, si lo declara."""
+    lib = os.path.join(pkg_dir, "lib")
+    manifest = os.path.join(pkg_dir, "package.json")
+    if not (os.path.isdir(lib) and os.path.isfile(manifest)):
+        return
+    try:
+        with open(manifest, encoding="utf-8") as f:
+            meta = json.load(f)
+        label = f"{meta['name']}@{meta.get('version', '?')}"
+    except (OSError, ValueError, KeyError):
+        return
+    for root, _, files in os.walk(lib):
+        for name in files:
+            if not name.endswith(".js"):
+                continue
+            try:
+                with open(os.path.join(root, name), encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+            except OSError:
+                continue
+            if VOCAB_MARKER not in src:
+                continue
+            for kind in APPEND_LITERAL.findall(src):
+                owners.setdefault(kind, label)
+
+
+def scan_plugin_vocabulary(node_modules):
+    """Mapa tipo -> "paquete@version" de los plugins que registran vocabulario.
+
+    Itera el primer nivel de node_modules (mas un nivel por cada @scope). El
+    plugin que importa aca vive top-level (`node_modules/dsh-swarm-panel`), asi
+    que cualquier filtro que saltee ese nivel deja el mapa vacio.
+    """
+    owners = {}
+    if not node_modules or not os.path.isdir(node_modules):
+        return owners
+    for entry in os.scandir(node_modules):
+        if not entry.is_dir() or entry.name in NODE_MODULES_SKIP:
+            continue
+        if entry.name.startswith("@"):
+            for sub in os.scandir(entry.path):
+                if sub.is_dir():
+                    _scan_pkg(sub.path, owners)
+        else:
+            _scan_pkg(entry.path, owners)
+    return owners
+
+
+def classify_session(workspace, directory, session_dir, baseline, owners):
+    """Clasifica una sesion en ok / at-risk / broken / unsupported-version / unreadable."""
+    artifact = None
+    for name in ("session.jsonl.zstd", "session.jsonl"):
+        candidate = os.path.join(session_dir, name)
+        if os.path.isfile(candidate):
+            artifact = candidate
+            break
+    if artifact is None:
+        return None
+
+    base = {"workspace": workspace, "directory": directory,
+            "artifact": os.path.basename(artifact)}
+    try:
+        header, events, torn = read_session_events(artifact)
+    except OSError:
+        return {**base, "id": directory, "risk": "unreadable",
+                "events": 0, "torn": True, "unknownTypes": []}
+    if header is None:
+        return {**base, "id": directory, "risk": "unreadable",
+                "events": len(events), "torn": torn, "unknownTypes": []}
+    if header.get("version") != 0:
+        return {**base, "id": header.get("id", directory),
+                "risk": "unsupported-version", "events": len(events),
+                "torn": torn, "unknownTypes": []}
+
+    counts = {}
+    for event in events:
+        kind = event.get("type")
+        # Contrato estricto del harness: solo el booleano true salva al evento.
+        if kind in baseline or event.get("ignorable") is True:
+            continue
+        counts[kind] = counts.get(kind, 0) + 1
+
+    unknown = [{"type": k, "count": v, "owner": owners.get(k)}
+               for k, v in sorted(counts.items())]
+    if not unknown:
+        risk = "ok"
+    elif all(item["owner"] for item in unknown):
+        risk = "at-risk"
+    else:
+        risk = "broken"
+    return {**base, "id": header.get("id", directory), "cwd": header.get("cwd"),
+            "createdAt": header.get("createdAt"), "events": len(events),
+            "risk": risk, "torn": torn, "unknownTypes": unknown}
+
+
+def cmd_scan(args):
+    baseline = load_baseline(args.harness)
+    owners = scan_plugin_vocabulary(args.profile_node_modules)
+    results = []
+    if os.path.isdir(args.sessions):
+        for workspace in sorted(os.listdir(args.sessions)):
+            ws_dir = os.path.join(args.sessions, workspace)
+            if not os.path.isdir(ws_dir):
+                continue
+            for directory in sorted(os.listdir(ws_dir)):
+                session_dir = os.path.join(ws_dir, directory)
+                if not os.path.isdir(session_dir):
+                    continue
+                info = classify_session(workspace, directory, session_dir, baseline, owners)
+                if info is not None:
+                    results.append(info)
+    json.dump({"sessions": results, "baseline": sorted(baseline),
+               "owners": owners, "baselineCount": len(baseline)},
+              sys.stdout, indent=2)
+    print()
+    if args.fail_on_risk:
+        if any(r["risk"] == "broken" for r in results):
+            sys.exit(4)
+        if any(r["risk"] == "at-risk" for r in results):
+            sys.exit(3)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="session-scan.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -85,6 +268,14 @@ def main():
     p.add_argument("--harness", required=True, help="ruta a dsh-session/lib/index.js")
     p.add_argument("--known", default=None, help="baseline vendorizado, para comparar")
     p.set_defaults(func=cmd_baseline)
+    p = sub.add_parser("scan", help="clasifica las sesiones por riesgo")
+    p.add_argument("--sessions", required=True, help="ruta a $DSH_HOME/sessions")
+    p.add_argument("--harness", required=True, help="ruta a dsh-session/lib/index.js")
+    p.add_argument("--profile-node-modules", default=None,
+                   help="node_modules del profile, para mapear tipo -> plugin")
+    p.add_argument("--fail-on-risk", action="store_true",
+                   help="sale 3 si hay at-risk, 4 si hay broken")
+    p.set_defaults(func=cmd_scan)
     args = parser.parse_args()
     args.func(args)
 

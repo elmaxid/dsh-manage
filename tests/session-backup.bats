@@ -110,3 +110,123 @@ assert d["changed"] is False, (
 )
 PY
 }
+
+# Crea una sesion sintetica comprimida. $1=dir sessions, $2=workspace,
+# $3=nombre-de-directorio, $4=id-en-el-header, $5..=lineas JSON.
+fake_session() {
+  local root="$1" ws="$2" dir="$3" sid="$4"; shift 4
+  local d="$root/$ws/$dir"
+  mkdir -p "$d"
+  {
+    printf '{"type":"session","version":0,"id":"%s","createdAt":1,"cwd":"/tmp/%s"}\n' "$sid" "$ws"
+    local line
+    for line in "$@"; do printf '%s\n' "$line"; done
+  } | zstd -q -o "$d/session.jsonl.zstd"
+}
+
+# Plugin falso que declara vocabulario, en layout pnpm REAL (top-level).
+fake_plugin() {
+  local nm="$1" name="$2" tipo="$3"
+  mkdir -p "$nm/$name/lib"
+  printf '{"name":"%s","version":"9.9.9"}\n' "$name" > "$nm/$name/package.json"
+  cat > "$nm/$name/lib/index.js" <<EOF
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+export function emit(session) { session.append("$tipo", {}); }
+EOF
+}
+
+@test "sesion con solo tipos del baseline es ok" {
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-a--" "session-aaa" "session-aaa" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"risk": "ok"'* ]]
+}
+
+@test "las filas de chunks NO cuentan como tipos desconocidos" {
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-chunk--" "session-chunk" "session-chunk" \
+    '{"type":"reasoning-chunks","seq0":5,"time0":1,"data":{"index":0,"texts":["a","b","c"],"dt":[1,1]}}' \
+    '{"type":"text-chunks","seq0":9,"time0":2,"data":{"index":0,"texts":["x"],"dt":[]}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"risk": "ok"'* ]]
+  # 3 + 1 chunks expandidos a assistant/chunk
+  [[ "$output" == *'"events": 4'* ]]
+}
+
+@test "tipo desconocido sin dueno instalado es broken" {
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-b--" "session-bbb" "session-bbb" \
+    '{"type":"foo/bar","seq":1,"time":1,"data":{}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"risk": "broken"'* ]]
+}
+
+@test "tipo desconocido con plugin top-level que lo declara es at-risk" {
+  h="$(install_fake_harness 48)"
+  nm="$BATS_TEST_TMPDIR/nm"
+  fake_plugin "$nm" "plugin-falso" "foo/bar"
+  fake_session "$DSH_HOME/sessions" "--ws-c--" "session-ccc" "session-ccc" \
+    '{"type":"foo/bar","seq":1,"time":1,"data":{}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h" --profile-node-modules "$nm"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"risk": "at-risk"'* ]]
+  [[ "$output" == *"plugin-falso@9.9.9"* ]]
+}
+
+@test "el vocabulario solo cuenta literales de append, no de ctx.on" {
+  h="$(install_fake_harness 48)"
+  nm="$BATS_TEST_TMPDIR/nm"
+  mkdir -p "$nm/plugin-listener/lib"
+  printf '{"name":"plugin-listener","version":"1.0.0"}\n' > "$nm/plugin-listener/package.json"
+  cat > "$nm/plugin-listener/lib/index.js" <<'EOF'
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+export function apply(ctx) { ctx.on("agente/inventado", () => {}); }
+EOF
+  fake_session "$DSH_HOME/sessions" "--ws-d--" "session-ddd" "session-ddd" \
+    '{"type":"agente/inventado","seq":1,"time":1,"data":{}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h" --profile-node-modules "$nm"
+  [ "$status" -eq 0 ]
+  # ctx.on no declara vocabulario: sigue siendo broken, sin dueno falso
+  [[ "$output" == *'"risk": "broken"'* ]]
+  [[ "$output" != *"plugin-listener"* ]]
+}
+
+@test "ignorable true hace que el tipo desconocido no cuente" {
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-e--" "session-eee" "session-eee" \
+    '{"type":"foo/bar","seq":1,"time":1,"ignorable":true,"data":{}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"risk": "ok"'* ]]
+}
+
+@test "ignorable null NO cuenta como ignorable (regresion vpn-monitor)" {
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-f--" "session-fff" "session-fff" \
+    '{"type":"foo/bar","seq":1,"time":1,"ignorable":null,"data":{}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"risk": "broken"'* ]]
+}
+
+@test "scan emite el directorio real, distinto del id del header" {
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-g--" "67436620" "session-67436620" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"directory": "67436620"'* ]]
+  [[ "$output" == *'"id": "session-67436620"'* ]]
+}
+
+@test "fail-on-risk sale 4 si hay broken" {
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-h--" "session-hhh" "session-hhh" \
+    '{"type":"foo/bar","seq":1,"time":1,"data":{}}'
+  run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h" --fail-on-risk
+  [ "$status" -eq 4 ]
+}
