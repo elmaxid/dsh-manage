@@ -7,3 +7,7 @@ dsh.pid
 # Editor / OS
 .DS_Store
 *.swp
+
+# Python
+__pycache__/
+*.pyc

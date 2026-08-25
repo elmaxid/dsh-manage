@@ -259,7 +259,7 @@ git commit -m "feat(session-backup): baseline de tipos de evento con vendorizado
 
 **Interfaces:**
 - Consumes: `load_baseline()` de la Task 1.
-- Produces: CLI `session-scan.py scan --sessions <dir> --harness <ruta> [--profile-node-modules <dir>] [--fail-on-risk]` → JSON `{"sessions":[{"id","directory","workspace","cwd","artifact","events","risk","torn","unknownTypes":[{"type","count","owner"}]}],"baseline":[…],"owners":{…},"baselineCount":N}`.
+- Produces: CLI `session-scan.py scan --sessions <dir> --harness <ruta> [--profile-node-modules <dir>] [--fail-on-risk]` → JSON `{"sessions":[{"id","directory","workspace","cwd","createdAt","artifact","events","risk","torn","unknownTypes":[{"type","count","owner"}]}],"baseline":[…],"owners":{…},"baselineCount":N}`. `createdAt` (del header, cuando existe) lo consume Task 4 para el `MANIFEST.json` del snapshot.
   **`directory` es el nombre real del directorio enumerado** — nunca se deriva de `id`.
   Códigos: 0 todo ok; con `--fail-on-risk`, 3 si hay `at-risk`, 4 si hay `broken`.
 

@@ -870,5 +870,5 @@ case "${1:-}" in
   version)          version ;;
   check-update)     check_update ;;
   --version|-V)     echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
-  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan}|version|check-update}"; exit 1 ;;
+  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify}|version|check-update}"; exit 1 ;;
 esac
