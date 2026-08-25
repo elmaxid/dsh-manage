@@ -230,3 +230,42 @@ EOF
   run python3 "$SCAN" scan --sessions "$DSH_HOME/sessions" --harness "$h" --fail-on-risk
   [ "$status" -eq 4 ]
 }
+
+@test "session-backup sin subcomando imprime uso y falla" {
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"uso:"* ]]
+  [[ "$output" == *"scan"* ]]
+}
+
+@test "session-backup scan sin sesiones no falla" {
+  install_fake_harness 48
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup scan
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"0 sesiones"* ]]
+}
+
+@test "session-backup scan imprime la tabla sin traceback" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-t--" "session-ttt" "session-ttt" \
+    '{"type":"foo/bar","seq":1,"time":1,"data":{}}'
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup scan
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"workspace"* ]]
+  [[ "$output" == *"session-ttt"* ]]
+  [[ "$output" != *"Traceback"* ]]
+  [[ "$output" != *"SyntaxError"* ]]
+}
+
+@test "session-backup scan acepta --profile con valor" {
+  install_fake_harness 48
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup scan --profile repro
+  [ "$status" -eq 0 ]
+}
+
+@test "session-backup scan rechaza --profile sin valor" {
+  install_fake_harness 48
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup scan --profile
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--profile"* ]]
+}

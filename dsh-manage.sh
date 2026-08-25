@@ -470,6 +470,114 @@ UNIT_EOF
   echo "(no mezclar con 'dsh-manage {start,stop}' mientras el unit esté activo — ambos gestionan el mismo puerto)"
 }
 
+# Raiz de snapshots: HERMANA de sessions/, nunca hija — todo lo que cuelga de
+# sessions/ es candidato a que el backend lo enumere como una sesion mas.
+DSH_BACKUP_ROOT="${DSH_BACKUP_ROOT:-$DSH_HOME/session-backups}"
+
+# Ruta al index.js de @deepseek-ai/dsh-session dentro del harness instalado.
+# De ahi sale el baseline de tipos de evento; nunca se hardcodea la lista.
+dsh_session_lib_path() {
+  echo "$DSH_PREFIX/lib/node_modules/$DSH_PKG/node_modules/@deepseek-ai/dsh-session/lib/index.js"
+}
+
+# Preflight: herramientas, harness legible y backup root fuera de sessions/.
+session_backup_preflight() {
+  local missing=() tool
+  for tool in python3 zstd sha256sum flock; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "faltan herramientas requeridas: ${missing[*]}" >&2
+    return 1
+  fi
+  local lib
+  lib="$(dsh_session_lib_path)"
+  if [ ! -f "$lib" ]; then
+    echo "no se encontro el harness en $lib — ¿esta dsh instalado?" >&2
+    return 1
+  fi
+  # Invariante #1 del spec: los snapshots nunca pueden vivir bajo sessions/.
+  case "$DSH_BACKUP_ROOT/" in
+    "$DSH_HOME/sessions/"*)
+      echo "DSH_BACKUP_ROOT no puede estar dentro de $DSH_HOME/sessions" >&2
+      return 1 ;;
+  esac
+}
+
+# scan: clasifica las sesiones por riesgo. SOLO LECTURA sobre sessions/.
+session_backup_scan() {
+  local profile="web" fail_on_risk=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile)
+        [ $# -ge 2 ] || { echo "falta el valor de --profile" >&2; return 1; }
+        profile="$2"; shift 2 ;;
+      --fail-on-risk) fail_on_risk=1; shift ;;
+      *) echo "opcion desconocida para scan: $1" >&2; return 1 ;;
+    esac
+  done
+
+  session_backup_preflight || return 1
+  local sessions_dir="$DSH_HOME/sessions"
+  if [ ! -d "$sessions_dir" ]; then
+    echo "0 sesiones ($sessions_dir no existe)"
+    return 0
+  fi
+
+  local args=(
+    "$DSH_MANAGE_DIR/plugins/session-scan.py" scan
+    --sessions "$sessions_dir"
+    --harness "$(dsh_session_lib_path)"
+  )
+  local profile_nm="$DSH_HOME/profiles/$profile/node_modules"
+  [ -d "$profile_nm" ] && args+=(--profile-node-modules "$profile_nm")
+  [ "$fail_on_risk" -eq 1 ] && args+=(--fail-on-risk)
+
+  local out rc=0
+  out="$(python3 "${args[@]}")" || rc=$?
+  if [ -z "$out" ]; then
+    echo "el escaneo no devolvio datos" >&2
+    return 1
+  fi
+  # El JSON va por argv: el heredoc ya ocupa stdin.
+  python3 - "$out" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+rows = d["sessions"]
+if not rows:
+    print("0 sesiones encontradas")
+    sys.exit(0)
+print(f'{"workspace":30} {"sesion":26} {"eventos":>8}  {"riesgo":10} dueno')
+for r in rows:
+    unknown = r.get("unknownTypes", [])
+    if unknown:
+        total = sum(u["count"] for u in unknown)
+        owners = sorted({u["owner"] or "sin dueno" for u in unknown})
+        detalle = f'{", ".join(owners)} ({total} ev. en {len(unknown)} tipos)'
+    else:
+        detalle = "-"
+    print(f'{r["workspace"][:30]:30} {r["directory"][:26]:26} {r["events"]:>8}  {r["risk"]:10} {detalle}')
+riesgo = [r for r in rows if r["risk"] != "ok"]
+print()
+if riesgo:
+    print(f'{len(riesgo)} de {len(rows)} sesiones no-ok.')
+    print('   → dsh-manage session-backup create --only-at-risk --label pre-cambios')
+else:
+    print(f'{len(rows)} sesiones, todas ok.')
+PY
+  return $rc
+}
+
+# Despachador de los subcomandos de session-backup.
+session_backup() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    scan)     session_backup_scan "$@" ;;
+    *) echo "uso: $0 session-backup {scan}"; return 1 ;;
+  esac
+}
+
 update() {
   stop || true
   echo "desinstalando version actual..."
@@ -587,8 +695,9 @@ case "${1:-}" in
   install)          install ;;
   plugins-install)  plugins_install "${2:-}" ;;
   service-install)  service_install ;;
+  session-backup)   session_backup "${@:2}" ;;
   version)          version ;;
   check-update)     check_update ;;
   --version|-V)     echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
-  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|version|check-update}"; exit 1 ;;
+  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan}|version|check-update}"; exit 1 ;;
 esac
