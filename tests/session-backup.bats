@@ -396,3 +396,17 @@ assert "harness" in sp.get("note", "").lower(), "la nota debe aclarar que el fix
 PY
   [ "$status" -eq 0 ]
 }
+
+@test "el manifest del snapshot registra la version de dsh-manage" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-ver--" "session-ver" "session-ver" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label version
+  snap="$(ls -d "$DSH_BACKUP_ROOT"/*-version)"
+  run python3 -c "
+import json
+m = json.load(open('$snap/MANIFEST.json'))
+assert m['dshManageVersion'] == '1.2.0', m['dshManageVersion']
+"
+  [ "$status" -eq 0 ]
+}
