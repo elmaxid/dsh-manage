@@ -568,13 +568,177 @@ PY
   return $rc
 }
 
+# create: snapshot atomico. Construye en <nombre>.partial/ y renombra al final
+# — un directorio con nombre final es, por invariante, un snapshot completo.
+# Ante fallo el .partial SE CONSERVA (spec §5.1): es la evidencia de que se
+# alcanzo a copiar, y borrarlo abria un vector de traversal via --label.
+session_backup_create() {
+  local label="manual" only_at_risk=0 profile="web"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label)
+        [ $# -ge 2 ] || { echo "falta el valor de --label" >&2; return 1; }
+        label="$2"; shift 2 ;;
+      --profile)
+        [ $# -ge 2 ] || { echo "falta el valor de --profile" >&2; return 1; }
+        profile="$2"; shift 2 ;;
+      --only-at-risk) only_at_risk=1; shift ;;
+      *) echo "opcion desconocida para create: $1" >&2; return 1 ;;
+    esac
+  done
+
+  # El label entra en una ruta: sin validar, '../../x' escapa del backup root.
+  if ! printf '%s' "$label" | grep -qE '^[A-Za-z0-9._-]+$'; then
+    echo "label invalido: solo se permiten [A-Za-z0-9._-]" >&2
+    return 1
+  fi
+
+  session_backup_preflight || return 1
+  umask 077
+  local sessions_dir="$DSH_HOME/sessions"
+  if [ ! -d "$sessions_dir" ]; then
+    echo "nada que respaldar ($sessions_dir no existe)"
+    return 2
+  fi
+
+  mkdir -p "$DSH_BACKUP_ROOT"
+  local stamp snap partial
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  snap="$DSH_BACKUP_ROOT/${stamp}-${label}"
+  partial="${snap}.partial"
+  if [ -e "$snap" ] || [ -e "$partial" ]; then
+    echo "ya existe un snapshot con ese nombre: $snap" >&2
+    return 1
+  fi
+  mkdir -p "$partial/sessions"
+
+  local rc=0
+  # Lock: dos colegas corriendo create en paralelo no se pisan. El subshell
+  # cierra el fd al salir, sin dejarlo colgado en el proceso.
+  (
+    flock -w 30 9 || { echo "otro session-backup esta corriendo" >&2; exit 1; }
+
+    local scan_args=(
+      "$DSH_MANAGE_DIR/plugins/session-scan.py" scan
+      --sessions "$sessions_dir"
+      --harness "$(dsh_session_lib_path)"
+    )
+    local profile_nm="$DSH_HOME/profiles/$profile/node_modules"
+    [ -d "$profile_nm" ] && scan_args+=(--profile-node-modules "$profile_nm")
+    python3 "${scan_args[@]}" > "$partial/scan.json" || exit 1
+
+    DSH_LABEL="$label" DSH_ONLY_AT_RISK="$only_at_risk" DSH_PROFILE="$profile" \
+    DSH_MANAGE_VERSION="$DSH_MANAGE_VERSION" \
+    python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" snapshot \
+      --scan-json "$partial/scan.json" --snap-dir "$partial" --sessions "$sessions_dir" \
+      || exit $?
+  ) 9>"$DSH_BACKUP_ROOT/.lock" || rc=$?
+
+  if [ "$rc" -eq 2 ]; then
+    rmdir "$partial/sessions" "$partial" 2>/dev/null || true
+    echo "nada que respaldar (ninguna sesion coincide con el filtro)"
+    return 2
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "fallo la creacion del snapshot; se conserva $partial para inspeccion" >&2
+    return 1
+  fi
+
+  session_backup_verify_dir "$partial" || {
+    echo "el snapshot no valida; se conserva $partial para inspeccion" >&2
+    return 1
+  }
+
+  mv -T "$partial" "$snap"
+  ln -sfn "$(basename "$snap")" "$DSH_BACKUP_ROOT/.latest.tmp"
+  mv -T "$DSH_BACKUP_ROOT/.latest.tmp" "$DSH_BACKUP_ROOT/latest"
+  echo "snapshot creado: $snap"
+}
+
+# Validacion completa de un snapshot: checksums + zstd -t + header parseable.
+# La comparten `create` (antes de publicar) y `verify`.
+session_backup_verify_dir() {
+  local snap="$1"
+  [ -s "$snap/CHECKSUMS.sha256" ] || { echo "CHECKSUMS.sha256 ausente o vacio" >&2; return 1; }
+  ( cd "$snap" && sha256sum -c CHECKSUMS.sha256 >/dev/null ) \
+    || { echo "checksums no verifican en $snap" >&2; return 1; }
+  local artifact
+  while IFS= read -r artifact; do
+    case "$artifact" in
+      *.zstd)
+        zstd -t "$artifact" >/dev/null 2>&1 \
+          || { echo "zstd corrupto: $artifact" >&2; return 1; }
+        # head -1 hace que zstd reciba SIGPIPE; bajo pipefail eso mata el
+        # pipeline aunque python3 exita. Aislamos la decodificacion en un
+        # subshell con pipefail desactivado para que solo importe el rc de python3.
+        ( set +o pipefail; zstd -dc "$artifact" 2>/dev/null | head -1 | python3 -c '
+import json, sys
+line = sys.stdin.readline()
+row = json.loads(line)
+assert row.get("type") == "session", row.get("type")
+' >/dev/null ) 2>&1 || { echo "header ilegible: $artifact" >&2; return 1; } ;;
+      *.jsonl)
+        head -1 "$artifact" | python3 -c '
+import json, sys
+row = json.loads(sys.stdin.readline())
+assert row.get("type") == "session", row.get("type")
+' >/dev/null 2>&1 || { echo "header ilegible: $artifact" >&2; return 1; } ;;
+    esac
+  done < <(find "$snap/sessions" -type f 2>/dev/null)
+  return 0
+}
+
+# list: snapshots completos (los .partial se ignoran por invariante).
+session_backup_list() {
+  if [ ! -d "$DSH_BACKUP_ROOT" ]; then
+    echo "no hay snapshots ($DSH_BACKUP_ROOT no existe)"
+    return 0
+  fi
+  local found=0 partials=0 dir
+  for dir in "$DSH_BACKUP_ROOT"/*/; do
+    [ -d "$dir" ] || continue
+    case "$dir" in *.partial/) partials=$((partials + 1)); continue ;; esac
+    [ -f "${dir}MANIFEST.json" ] || continue
+    found=$((found + 1))
+    python3 - "${dir}MANIFEST.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(f'{m["createdAt"]}  {m["label"]:28} {len(m["sessions"]):>3} sesiones  ({m.get("trigger","manual")})')
+PY
+  done
+  [ "$found" -eq 0 ] && echo "no hay snapshots completos"
+  [ "$partials" -gt 0 ] && \
+    echo "aviso: hay $partials snapshot(s) .partial de intentos incompletos; borrables a mano"
+  return 0
+}
+
+# verify: integridad de un snapshot ya publicado.
+session_backup_verify() {
+  local from="latest"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)
+        [ $# -ge 2 ] || { echo "falta el valor de --from" >&2; return 1; }
+        from="$2"; shift 2 ;;
+      *) echo "opcion desconocida para verify: $1" >&2; return 1 ;;
+    esac
+  done
+  local snap="$DSH_BACKUP_ROOT/$from"
+  [ -d "$snap" ] || { echo "snapshot no encontrado: $snap" >&2; return 1; }
+  session_backup_verify_dir "$snap" || return 1
+  echo "OK — $snap integro"
+}
+
 # Despachador de los subcomandos de session-backup.
 session_backup() {
   local sub="${1:-}"
   shift || true
   case "$sub" in
     scan)     session_backup_scan "$@" ;;
-    *) echo "uso: $0 session-backup {scan}"; return 1 ;;
+    create)   session_backup_create "$@" ;;
+    list)     session_backup_list "$@" ;;
+    verify)   session_backup_verify "$@" ;;
+    *) echo "uso: $0 session-backup {scan|create|list|verify}"; return 1 ;;
   esac
 }
 

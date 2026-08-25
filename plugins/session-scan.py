@@ -6,11 +6,14 @@ logs de sesion y clasifica el riesgo. Emite JSON a stdout.
 Nunca escribe bajo $DSH_HOME/sessions/ — es de solo lectura sobre las sesiones.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 # Piso de cordura: un baseline vacio marcaria TODA sesion como `broken` e
 # induciria un repair masivo destructivo. Menos de esto = fallo duro.
@@ -261,6 +264,89 @@ def cmd_scan(args):
             sys.exit(3)
 
 
+def cmd_snapshot(args):
+    """Copia los artefactos y escribe MANIFEST.json, CHECKSUMS.sha256 y
+    vocabulary.json. Copia, nunca mueve: el original se abre solo en lectura.
+
+    Falla si la cantidad copiada no coincide con la esperada: un snapshot
+    parcial publicado como completo da falsa seguridad.
+    """
+    snap, sessions_dir = args.snap_dir, args.sessions
+    only_at_risk = os.environ.get("DSH_ONLY_AT_RISK") == "1"
+    with open(args.scan_json, encoding="utf-8") as f:
+        scan = json.load(f)
+
+    esperadas = [r for r in scan["sessions"]
+                 if not (only_at_risk and r["risk"] == "ok")]
+    entries, checksums, faltantes = [], [], []
+
+    for row in esperadas:
+        # `directory` viene del enumerado real del scan: nunca se deriva del id.
+        rel = os.path.join("sessions", row["workspace"], row["directory"], row["artifact"])
+        src = os.path.join(sessions_dir, row["workspace"], row["directory"], row["artifact"])
+        if not os.path.isfile(src):
+            faltantes.append(rel)
+            continue
+        dst = os.path.join(snap, rel)
+        os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+        try:
+            shutil.copy(src, dst)          # copy, no copy2: no arrastra permisos del origen
+            os.chmod(dst, 0o600)
+        except OSError as exc:
+            faltantes.append(f"{rel} ({exc})")
+            continue
+        digest = hashlib.sha256()
+        with open(dst, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        checksums.append(f"{digest.hexdigest()}  {rel}")
+        entries.append({**row, "sha256": digest.hexdigest(),
+                        "bytes": os.path.getsize(dst)})
+
+    if faltantes:
+        raise SystemExit(
+            "no se pudieron copiar {} de {} sesiones esperadas:\n  {}".format(
+                len(faltantes), len(esperadas), "\n  ".join(faltantes)))
+
+    if not entries:
+        # Sin nada que respaldar: no se publica un snapshot vacio.
+        raise SystemExit(2)
+
+    manifest = {
+        "schemaVersion": 1,
+        "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "label": os.environ.get("DSH_LABEL", "manual"),
+        "trigger": os.environ.get("DSH_TRIGGER", "manual"),
+        "dshManageVersion": os.environ.get("DSH_MANAGE_VERSION", "?"),
+        "dshHome": os.path.dirname(sessions_dir),
+        "profile": os.environ.get("DSH_PROFILE", "web"),
+        "sessionFormatVersion": 0,
+        "sessions": entries,
+    }
+    with open(os.path.join(snap, "MANIFEST.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    # vocabulary.json: la receta de QUE reinstalar para volver a leer esto.
+    # Es dato perecedero — solo `create` esta en posicion de congelarlo.
+    with open(os.path.join(snap, "vocabulary.json"), "w", encoding="utf-8") as f:
+        json.dump({"baseline": scan["baseline"], "owners": scan["owners"],
+                   "baselineCount": scan["baselineCount"]}, f, indent=2)
+
+    for extra in ("MANIFEST.json", "vocabulary.json", "scan.json"):
+        path = os.path.join(snap, extra)
+        if not os.path.isfile(path):
+            continue
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        checksums.append(f"{digest.hexdigest()}  {extra}")
+
+    with open(os.path.join(snap, "CHECKSUMS.sha256"), "w", encoding="utf-8") as f:
+        f.write("\n".join(checksums) + "\n")
+    print(f"{len(entries)} sesiones copiadas")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="session-scan.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -276,6 +362,11 @@ def main():
     p.add_argument("--fail-on-risk", action="store_true",
                    help="sale 3 si hay at-risk, 4 si hay broken")
     p.set_defaults(func=cmd_scan)
+    p = sub.add_parser("snapshot", help="copia artefactos y escribe manifest (uso interno)")
+    p.add_argument("--scan-json", required=True)
+    p.add_argument("--snap-dir", required=True)
+    p.add_argument("--sessions", required=True)
+    p.set_defaults(func=cmd_snapshot)
     args = parser.parse_args()
     args.func(args)
 

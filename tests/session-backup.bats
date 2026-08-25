@@ -269,3 +269,97 @@ EOF
   [ "$status" -ne 0 ]
   [[ "$output" == *"--profile"* ]]
 }
+
+@test "create produce snapshot con manifest, checksums y vocabulary verificables" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-x--" "session-xxx" "session-xxx" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label prueba
+  [ "$status" -eq 0 ]
+  snap="$(ls -d "$DSH_BACKUP_ROOT"/*-prueba)"
+  [ -f "$snap/MANIFEST.json" ]
+  [ -f "$snap/CHECKSUMS.sha256" ]
+  [ -f "$snap/vocabulary.json" ]
+  [ -f "$snap/sessions/--ws-x--/session-xxx/session.jsonl.zstd" ]
+  ( cd "$snap" && sha256sum -c CHECKSUMS.sha256 )
+  python3 -c "
+import json,sys
+v=json.load(open('$snap/vocabulary.json'))
+assert len(v['baseline'])==48, v
+"
+}
+
+@test "create preserva el nombre real del directorio, no el id del header" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-y--" "67436620" "session-67436620" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label opaco
+  [ "$status" -eq 0 ]
+  snap="$(ls -d "$DSH_BACKUP_ROOT"/*-opaco)"
+  [ -f "$snap/sessions/--ws-y--/67436620/session.jsonl.zstd" ]
+}
+
+@test "create no modifica nada bajo sessions/ (contenido ni metadata)" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-z--" "session-zzz" "session-zzz" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  before="$(find "$DSH_HOME/sessions" \( -type f -o -type d \) -printf '%p %s %m\n' | sort; \
+            find "$DSH_HOME/sessions" -type f -exec sha256sum {} + | sort)"
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label limpio
+  [ "$status" -eq 0 ]
+  after="$(find "$DSH_HOME/sessions" \( -type f -o -type d \) -printf '%p %s %m\n' | sort; \
+           find "$DSH_HOME/sessions" -type f -exec sha256sum {} + | sort)"
+  [ "$before" = "$after" ]
+}
+
+@test "create sin nada que respaldar sale 2 y no publica" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-ok--" "session-ok" "session-ok" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --only-at-risk --label vacio
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"nada que respaldar"* ]]
+  run bash -c "ls -d '$DSH_BACKUP_ROOT'/*-vacio 2>/dev/null"
+  [ "$status" -ne 0 ]
+}
+
+@test "create rechaza un label con traversal" {
+  install_fake_harness 48
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label '../../etc'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"label"* ]]
+}
+
+@test "list muestra el snapshot valido, ignora .partial y avisa de ellos" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-l--" "session-lll" "session-lll" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label listable
+  mkdir -p "$DSH_BACKUP_ROOT/20260101T000000Z-fallido.partial"
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup list
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"listable"* ]]
+  [[ "$output" != *"fallido"* ]]
+  [[ "$output" == *".partial"* ]]
+}
+
+@test "verify valida el snapshot creado" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-v--" "session-vvv" "session-vvv" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label verificable
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup verify --from latest
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"OK"* ]]
+}
+
+@test "verify detecta un artefacto corrupto" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-c2--" "session-c2" "session-c2" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label corrupto
+  snap="$(ls -d "$DSH_BACKUP_ROOT"/*-corrupto)"
+  printf 'basura' > "$snap/sessions/--ws-c2--/session-c2/session.jsonl.zstd"
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup verify --from "$(basename "$snap")"
+  [ "$status" -ne 0 ]
+}
