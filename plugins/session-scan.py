@@ -25,6 +25,10 @@ def extract_baseline(harness_path):
     start = src.find(marker)
     if start == -1:
         raise SystemExit("no se encontro KNOWN_SESSION_EVENT_TYPES en el harness")
+    # Supuesto: asume que ningun tipo de evento contiene el caracter ']' —
+    # verificado contra el harness real al momento de escribir esto. Si algun
+    # dia aparece un tipo con ']', este find cortaria prematuramente y el
+    # baseline quedaria incompleto; ante la duda, migrar a un parseo robusto.
     end = src.find("])", start)
     if end == -1:
         raise SystemExit("literal KNOWN_SESSION_EVENT_TYPES sin cierre")
@@ -48,8 +52,18 @@ def cmd_baseline(args):
     out = {"types": types, "count": len(types), "changed": False,
            "added": [], "removed": []}
     if args.known and os.path.isfile(args.known):
-        with open(args.known, encoding="utf-8") as f:
-            known = set(json.load(f).get("types", []))
+        try:
+            with open(args.known, encoding="utf-8") as f:
+                known_types = json.load(f).get("types", [])
+        except json.JSONDecodeError:
+            raise SystemExit(f"el archivo vendorizado {args.known} no es JSON valido")
+        # M3: un string u otro no-lista convierte a set de caracteres sin
+        # error; validar el tipo antes de construir el set.
+        if not isinstance(known_types, list):
+            raise SystemExit(
+                f"el campo 'types' del vendorizado {args.known} debe ser una lista"
+            )
+        known = set(known_types)
         added = sorted(set(types) - known)
         removed = sorted(known - set(types))
         out["changed"] = bool(added or removed)

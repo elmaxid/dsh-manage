@@ -1,4 +1,5 @@
 {
+  "_comment": "Vendorizado generado en el Step 5 del plan de session-backup. Su sincronizacion con el harness REAL instalado en este host es una verificacion MANUAL post-deploy: correr `plugins/session-scan.py baseline --harness <ruta-al-harness-instalado> --known plugins/known-session-event-types.json` y confirmar 'changed: false'. No se valida automaticamente en CI porque depende del harness del host, no del repo.",
   "types": [
     "agent-preset/selected",
     "agent/inbox/spliced",
