@@ -50,7 +50,7 @@ Todo el código de los fixes más críticos de esta v2 fue validado ejecutándol
 - **Ningún fallback de búsqueda de sesión usa `grep` sobre artefactos `.zstd`** — son binarios comprimidos.
 - **La validación previa a publicar un `repair` compara líneas y header contra el original**, no solo `zstd -t` (que valida el contenedor, no el contenido — verificado: un `.zstd` con basura adentro pasa `zstd -t` con rc=0).
 - Nombres de función y contrato JSON existentes (no romper): `dsh_session_lib_path()`, `session_backup_preflight()`, `DSH_BACKUP_ROOT`, `session_backup_verify_dir()`, `session_backup_create()`, `session_backup_scan()` (acepta **solo** `--profile <val>` y `--fail-on-risk`, nunca un posicional).
-- `DSH_MANAGE_VERSION` sube a `1.3.0` en la última tarea; el test existente que afirma `1.2.0` se actualiza en el mismo commit.
+- `DSH_MANAGE_VERSION` sube a `1.4.0` en la última tarea. **Nota**: mientras este plan estaba en revisión, `main` recibió un commit externo no relacionado (`3a73389`, actualización del stack de plugins homologado) que ya bumpeó a `1.3.0` por su cuenta — la próxima versión libre para este feature es `1.4.0`, no `1.3.0`. El test existente que afirma la versión de `dshManageVersion` en el manifest se actualiza en el mismo commit al valor real vigente al momento de implementar (verificar `grep DSH_MANAGE_VERSION dsh-manage.sh` antes de escribir el bump, por si hubo otro cambio externo entretanto).
 - `read_stable_bytes()` / `--include-live`: **fuera de alcance de Fases 3-5**.
 
 ---
@@ -62,7 +62,7 @@ Todo el código de los fixes más críticos de esta v2 fue validado ejecutándol
 | `plugins/session-scan.py` (modificar) | `repair_events()` (header excluido, aborta si torn), `find_session` (sin grep sobre binarios), `restore-plan`/`restore-new-id`. |
 | `dsh-manage.sh` (modificar) | `session_backup_restore()` (symlink resuelto antes del backup implícito), `session_backup_prune()` (protección por-sid), `session_backup_repair()` (temporales fuera de `sessions/`), `session_backup_guard()`, `plugins_remove()`, hook completo en `plugins_install()`, `restart_dsh()`, `invalidate_projcache_entry()`. |
 | `tests/session-backup.bats` (modificar) | Tests de las 7 tareas; el `SC2181` preexistente se corrige acá también. |
-| `README.md`, `CHANGELOG.md`, `dsh-manage.sh` (modificar) | Documentación y bump a 1.3.0. |
+| `README.md`, `CHANGELOG.md`, `dsh-manage.sh` (modificar) | Documentación y bump a la próxima versión libre (`1.4.0` al momento de escribir este plan — confirmar contra `main` antes de implementar Task 7). |
 
 ---
 
@@ -1581,7 +1581,7 @@ git commit -m "feat(session-backup): subcomando repair --mark-ignorable, header 
 
 - [ ] **Step 1: Bump de versión y arreglo del test heredado**
 
-Cambiar `DSH_MANAGE_VERSION="1.2.0"` a `"1.3.0"` en `dsh-manage.sh`. **En el mismo commit**, actualizar el test que afirma `'1.2.0'` en `tests/session-backup.bats` a `'1.3.0'`.
+Antes de tocar nada, correr `grep -n 'DSH_MANAGE_VERSION=' dsh-manage.sh` para confirmar la versión real vigente en `main` en este momento (al escribir este plan es `1.3.0`, por un cambio externo no relacionado con session-backup — ver nota en Global Constraints). Bumpear al siguiente patch/minor libre (`1.4.0` si la vigente sigue siendo `1.3.0`). **En el mismo commit**, actualizar el test que afirma la versión anterior en `tests/session-backup.bats` a la nueva.
 
 - [ ] **Step 2: Correr los tests**
 
@@ -1642,7 +1642,7 @@ Expected: shellcheck limpio, todos los tests verdes.
 
 ```bash
 git add dsh-manage.sh CHANGELOG.md README.md tests/session-backup.bats
-git commit -m "docs(session-backup): documentar restore/prune/repair/plugins-remove + bump a 1.3.0"
+git commit -m "docs(session-backup): documentar restore/prune/repair/plugins-remove + bump de version"
 ```
 
 ---
