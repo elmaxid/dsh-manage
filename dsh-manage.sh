@@ -826,7 +826,7 @@ session_backup_restore() {
   session_backup_create --label "pre-restore-$(date -u +%Y%m%dT%H%M%SZ)" || backup_rc=$?
   if [ "$backup_rc" -ne 0 ] && [ "$backup_rc" -ne 2 ]; then
     if [ "$force" -eq 1 ]; then
-      echo "aviso: el backup previo no se completo (rc=$backup_rc); --force fue pasado, continuando igualmente" >&2
+      echo "aviso: el backup previo no se completo (rc=$backup_rc). --force esta activo, asi que el restore sigue SIN ninguna copia de resguardo del estado actual -- esto puede deberse a que el estado esta corrupto (esperado si es lo que veniste a reparar) o a otra causa no relacionada (preflight, lock, disco); no hay forma de distinguirlas por el codigo de salida. Si no estabas al tanto de este riesgo, cancela con Ctrl-C." >&2
     else
       echo "fallo el backup previo (rc=$backup_rc); abortando restore sin tocar nada. Si el estado actual esta corrupto y es justamente lo que queres reparar, repeti con --force." >&2
       return 1
@@ -847,6 +847,11 @@ session_backup_restore() {
     [ -n "$src" ] || continue
 
     if [ "$to_new_id" -eq 1 ]; then
+      # Esta rama tambien escribe bajo sessions/ (un directorio nuevo, pero
+      # sigue siendo una escritura real) -- misma revalidacion TOCTOU que el
+      # camino normal, justo antes de crear/escribir cualquier cosa.
+      require_dsh_stopped || { echo "dsh arranco durante el restore; abortando antes de crear la nueva sesion" >&2; return 1; }
+
       local new_dir new_id
       new_id="session-$(python3 -c 'import uuid; print(uuid.uuid4())')"
       new_dir="$(cd "$(dirname "$dst")/.." && pwd)/$new_id"
@@ -857,8 +862,10 @@ session_backup_restore() {
       python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" restore-new-id \
         --artifact "$src" --new-id "$new_id" --out "$tmp_plain" || { rm -f "$tmp_plain"; return 1; }
       if [[ "$rewritten" == *.zstd ]]; then
-        zstd -q -f -o "$rewritten" "$tmp_plain" || { rm -f "$tmp_plain" "$rewritten"; return 1; }
+        local tmp_final="${rewritten}.restore-tmp"
+        zstd -q -f -o "$tmp_final" "$tmp_plain" || { rm -f "$tmp_plain" "$tmp_final"; return 1; }
         rm -f "$tmp_plain"
+        mv -T "$tmp_final" "$rewritten"
       else
         mv -T "$tmp_plain" "$rewritten"
       fi

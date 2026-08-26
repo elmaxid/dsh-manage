@@ -459,7 +459,7 @@ time.sleep(2)
   [ "$status" -eq 0 ]
 }
 
-@test "restore sin --force no pisa un destino que difiere" {
+@test "restore sin --force no pisa un destino que difiere (por corrupcion, el backup implicito ya aborta antes)" {
   install_fake_harness 48
   fake_session "$DSH_HOME/sessions" "--ws-r3--" "session-r3" "session-r3" \
     '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
@@ -469,6 +469,34 @@ time.sleep(2)
   [ "$status" -ne 0 ]
   [[ "$output" == *"--force"* ]]
   [ "$(cat "$DSH_HOME/sessions/--ws-r3--/session-r3/session.jsonl.zstd")" = "CORRUPTO" ]
+}
+
+@test "restore sin --force no pisa un destino VALIDO que difiere (ejercita el chequeo del loop, no el del backup)" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r7--" "session-r7" "session-r7" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r7
+  # Reescribimos la sesion con un .zstd VALIDO pero de contenido distinto
+  # (agrega un evento) -- a diferencia del test anterior, esto NO corrompe
+  # el artefacto, asi que el backup implicito (que corre verify_dir/zstd -t)
+  # tiene EXITO (rc=0). El flujo debe llegar entonces al chequeo real del
+  # loop (comparacion de sha256 vs --force), que es lo que este test
+  # verifica -- sin esto, un bug que borrara el chequeo del loop pasaria
+  # inadvertido porque el chequeo del backup implicito produce el mismo
+  # mensaje "--force" por una razon distinta.
+  {
+    printf '{"type":"session","version":0,"id":"session-r7","createdAt":1,"cwd":"/tmp/--ws-r7--"}\n'
+    printf '{"type":"tipo/1","seq":1,"time":1,"data":{}}\n'
+    printf '{"type":"tipo/2","seq":2,"time":2,"data":{}}\n'
+  } | zstd -q -f -o "$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd"
+  run zstd -t "$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+  content_antes="$(zstd -dc "$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd")"
+  run env DSH_PORT=39229 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r7
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"'$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd' existe y difiere del snapshot; use --force para pisarlo"* ]]
+  content_despues="$(zstd -dc "$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd")"
+  [ "$content_antes" = "$content_despues" ]
 }
 
 @test "restore --session limita a una sola sesion" {
