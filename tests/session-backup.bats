@@ -70,7 +70,8 @@ PY
   python3 "$SCAN" baseline --harness "$h" \
       --known "$BATS_TEST_TMPDIR/known.json" \
       > "$BATS_TEST_TMPDIR/out.json" 2>"$BATS_TEST_TMPDIR/err.txt"
-  [ "$?" -eq 0 ]
+  rc=$?
+  [ "$rc" -eq 0 ]
   [[ "$(cat "$BATS_TEST_TMPDIR/out.json")" == *'"changed": true'* ]]
   # B2: el ultimo tipo extraido (tipo/47) es el que se quito del vendorizado;
   # debe aparecer en "added" (demuestra que el script leyo el harness real) y
@@ -100,7 +101,8 @@ PY
   python3 "$SCAN" baseline --harness "$real_harness" \
       --known "$BATS_TEST_DIRNAME/../plugins/known-session-event-types.json" \
       > "$BATS_TEST_TMPDIR/out.json" 2>/dev/null
-  [ "$?" -eq 0 ]
+  rc=$?
+  [ "$rc" -eq 0 ]
   python3 - "$BATS_TEST_TMPDIR/out.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -540,4 +542,75 @@ time.sleep(2)
   run env DSH_PORT=39223 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
   [ "$status" -eq 0 ]
   [ -f "$DSH_HOME/sessions/--ws-r6--/session-r6/session.jsonl.zstd" ]
+}
+
+@test "prune sin --yes no borra nada" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p1--" "session-p1" "session-p1" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label uno
+  sleep 1.1
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label dos
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--yes"* ]]
+  count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' ! -path "$DSH_BACKUP_ROOT" | wc -l)"
+  [ "$count" -eq 2 ]
+}
+
+@test "prune --keep conserva los N mas recientes" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p2--" "session-p2" "session-p2" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label viejo
+  sleep 1.1
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label nuevo
+  viejo_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-viejo)"
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1 --yes
+  [ "$status" -eq 0 ]
+  [ ! -d "$viejo_dir" ]
+  ls -d "$DSH_BACKUP_ROOT"/*-nuevo
+}
+
+@test "prune nunca borra la unica copia de una sesion broken, incluso compartiendo snapshot con otra cubierta" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p3--" "session-S1" "session-S1" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  fake_session "$DSH_HOME/sessions" "--ws-p3--" "session-S2" "session-S2" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-A
+  a_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-snap-A)"
+  sleep 1.1
+  rm -rf "$DSH_HOME/sessions/--ws-p3--/session-S2"
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-B
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 0 --yes
+  [ "$status" -eq 0 ]
+  [ -d "$a_dir" ]
+}
+
+@test "prune borra sin protegerse de mas cuando la sesion SI tiene otra copia" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p4--" "session-S1" "session-S1" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-A
+  a_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-snap-A)"
+  sleep 1.1
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-B
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1 --yes
+  [ "$status" -eq 0 ]
+  [ ! -d "$a_dir" ]
+}
+
+@test "prune --older-than borra por edad" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p5--" "session-p5" "session-p5" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label reciente
+  snap="$(ls -d "$DSH_BACKUP_ROOT"/*-reciente)"
+  viejo="$DSH_BACKUP_ROOT/20200101T000000Z-viejo-de-verdad"
+  cp -r "$snap" "$viejo"
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --older-than 30 --yes
+  [ "$status" -eq 0 ]
+  [ ! -d "$viejo" ]
+  [ -d "$snap" ]
 }

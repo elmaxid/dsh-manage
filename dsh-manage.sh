@@ -904,6 +904,111 @@ for r in d['restores']:
   echo "restore completo: $count archivo(s) restaurado(s) desde $snap"
 }
 
+# prune: borra snapshots viejos por retencion. Proteccion POR SESION, no por
+# snapshot: procesa de mas viejo a mas nuevo, considerando "sobrevivientes"
+# a todo lo que no fue decidido a borrar TODAVIA en esta misma pasada.
+session_backup_prune() {
+  local keep=10 older_than="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep)
+        [ $# -ge 2 ] || { echo "falta el valor de --keep" >&2; return 1; }
+        keep="$2"; shift 2 ;;
+      --older-than)
+        [ $# -ge 2 ] || { echo "falta el valor de --older-than" >&2; return 1; }
+        older_than="$2"; shift 2 ;;
+      --yes) yes=1; shift ;;
+      *) echo "opcion desconocida para prune: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [ "$yes" -ne 1 ]; then
+    echo "prune requiere --yes para borrar de verdad" >&2
+    return 1
+  fi
+
+  [ -d "$DSH_BACKUP_ROOT" ] || { echo "no hay snapshots ($DSH_BACKUP_ROOT no existe)"; return 0; }
+
+  local candidates=() dir
+  for dir in "$DSH_BACKUP_ROOT"/*/; do
+    [ -d "$dir" ] || continue
+    case "${dir%/}" in *.partial|*/latest) continue ;; esac
+    [ -f "${dir}MANIFEST.json" ] || continue
+    candidates+=("${dir%/}")
+  done
+  mapfile -t candidates < <(printf '%s\n' "${candidates[@]}" | sort)
+
+  local total=${#candidates[@]}
+  local to_delete=()
+  if [ -n "$older_than" ]; then
+    local cutoff
+    cutoff="$(date -u -d "-${older_than} days" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u -v-"${older_than}"d +%Y%m%dT%H%M%SZ)"
+    for dir in "${candidates[@]}"; do
+      local name; name="$(basename "$dir")"
+      [[ "$name" < "$cutoff" ]] && to_delete+=("$dir")
+    done
+  else
+    if [ "$total" -gt "$keep" ]; then
+      local n_delete=$((total - keep)) i
+      for ((i = 0; i < n_delete; i++)); do
+        to_delete+=("${candidates[$i]}")
+      done
+    fi
+  fi
+
+  local deleted=0 protected=0 final_delete=()
+  for dir in "${to_delete[@]}"; do
+    local cur_survivors=() c
+    for c in "${candidates[@]}"; do
+      [ "$c" = "$dir" ] && continue
+      local already_deleted=0 fd
+      for fd in "${final_delete[@]}"; do [ "$fd" = "$c" ] && already_deleted=1; done
+      [ "$already_deleted" -eq 1 ] && continue
+      cur_survivors+=("$c")
+    done
+
+    local can_delete=1
+    local broken_sids
+    broken_sids="$(python3 -c "
+import json
+try:
+    m = json.load(open('$dir/MANIFEST.json'))
+except Exception:
+    raise SystemExit
+print(' '.join(s['id'] for s in m.get('sessions', []) if s.get('risk') == 'broken'))
+" 2>/dev/null)"
+    if [ -n "$broken_sids" ]; then
+      local sid
+      for sid in $broken_sids; do
+        local covered=0 other
+        for other in "${cur_survivors[@]}"; do
+          if python3 -c "
+import json, sys
+m = json.load(open('$other/MANIFEST.json'))
+sys.exit(0 if any(s['id'] == '$sid' for s in m['sessions']) else 1)
+" 2>/dev/null; then
+            covered=1
+          fi
+        done
+        if [ "$covered" -eq 0 ]; then
+          can_delete=0
+        fi
+      done
+    fi
+
+    if [ "$can_delete" -eq 1 ]; then
+      final_delete+=("$dir")
+      rm -rf -- "$dir"
+      deleted=$((deleted + 1))
+    else
+      protected=$((protected + 1))
+      echo "protegido (unica copia de al menos una sesion broken): $(basename "$dir")"
+    fi
+  done
+
+  echo "prune: $deleted snapshot(s) borrado(s), $protected protegido(s) por ser la unica copia de una sesion broken"
+}
+
 # Despachador de los subcomandos de session-backup.
 session_backup() {
   local sub="${1:-}"
@@ -914,7 +1019,8 @@ session_backup() {
     list)     session_backup_list "$@" ;;
     verify)   session_backup_verify "$@" ;;
     restore)  session_backup_restore "$@" ;;
-    *) echo "uso: $0 session-backup {scan|create|list|verify|restore}"; return 1 ;;
+    prune)    session_backup_prune "$@" ;;
+    *) echo "uso: $0 session-backup {scan|create|list|verify|restore|prune}"; return 1 ;;
   esac
 }
 
@@ -1039,5 +1145,5 @@ case "${1:-}" in
   version)          version ;;
   check-update)     check_update ;;
   --version|-V)     echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
-  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify|restore}|version|check-update}"; exit 1 ;;
+  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify|restore|prune}|version|check-update}"; exit 1 ;;
 esac
