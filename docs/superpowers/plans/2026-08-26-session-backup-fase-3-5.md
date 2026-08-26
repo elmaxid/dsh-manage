@@ -1,39 +1,57 @@
-# Session Backup (Fases 3-5) Implementation Plan
+# Session Backup (Fases 3-5) Implementation Plan — v2
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Completar `dsh-manage session-backup` con `restore`, `prune` y `repair`, y cerrar la causa raíz del incidente original integrando un gate de resguardo en `plugins-install`/`plugins-remove` (nuevo).
 
-**Architecture:** Extiende el `dsh-manage.sh` y `plugins/session-scan.py` que ya existen (Fase 1+2, mergeada como v1.2.0). `restore`/`repair` son las primeras funciones de todo el feature que escriben bajo `$DSH_HOME/sessions/` — por eso cada una hace un `create` implícito antes de tocar nada, exige DSH detenido, y usa escritura atómica (`cp` a temp + `mv -T`). `plugins_remove()` es nueva; reusa el patrón de restart que `plugins_install()` ya tiene, extraído a una función compartida.
+**Architecture:** Extiende el `dsh-manage.sh` y `plugins/session-scan.py` que ya existen (Fase 1+2, mergeada como v1.2.0). `restore`/`repair` son las primeras funciones de todo el feature que escriben bajo `$DSH_HOME/sessions/`.
 
 **Tech Stack:** bash (`set -euo pipefail`), python3 + zstd/sha256sum/flock, bats-core.
 
-**Spec:** `docs/SESSION-BACKUP-DESIGN.md` (§1, §4, §5, §7 completo — fases 3, 4 y 5; más las enmiendas §7.2, §7.3, §7.4)
+**Spec:** `docs/SESSION-BACKUP-DESIGN.md` (§1, §4, §5, §7 — fases 3, 4 y 5; enmiendas §7.2, §7.3, §7.4)
 
 ---
 
-## Contexto: qué cambió desde el spec original (leer antes de implementar)
+## Por qué esta es la v2 (leer antes de implementar)
 
-1. **El gate de `repair --mark-ignorable` (§5.5) ya se ejecutó y pasó** (§7.3 del spec, verificado contra el harness real: 34789 eventos, 0 rechazados, round-trip lossless). `repair` entra a este plan con confianza, no como "TBD".
-2. **`readStableFile` real del harness** (`dsh-session-persistence-jsonl/lib/index.js:904`) compara `(dev, ino, size, mtimeNs, ctimeNs)` en un loop **sin timeout** — el spec decía "hasta 3 reintentos" de forma aproximada. Este plan implementa su propia versión con **timeout acotado** (a diferencia del harness, un comando de operador no puede bloquearse indefinidamente); se documenta la diferencia en el código.
-3. **`plugins_remove()` no existe hoy** en `dsh-manage.sh` — es 100% nueva. Reusa `port_pid()`/`wait_for_port()` que ya existen (líneas 92/104).
-4. **`dsh plugin` es un wrapper directo a pnpm** en el profile dir (confirmado: `dsh plugin --profile <p> remove <pkg>` == `cd profile_dir && pnpm remove <pkg>`). Este plan usa `pnpm remove` directo en `plugins_remove()`, igual que `plugins_install()` ya usa `pnpm install`.
-5. **`gate_guard` del spec (§5.1 regla 6) es conceptual** — no existe como función de este proyecto ni hay que invocar nada externo; significa "antes de una operación destructiva, confirmar el target exacto", que este plan implementa con los checks explícitos de cada subcomando (no hay una tool `gate_guard` que el script deba llamar).
+La v1 de este plan fue sometida a revisión (2 críticos formales + árbitro) y **se refutó**. El árbitro encontró 5 hallazgos que ningún crítico había visto, uno con **pérdida de datos real**, todos verificados ejecutando código. Durante la escritura final de esta v2 se detectaron y corrigieron **dos hallazgos adicionales** de la misma clase (rutas de éxito bien pensadas, rutas de error degradando a pérdida silenciosa):
+
+1. **`prune` podía borrar el único backup de una sesión `broken`**. La causa: la variable de protección era global al snapshot en vez de evaluarse por sesión individual. **Corregido** en Task 2: protección evaluada sesión por sesión, procesando de más viejo a más nuevo.
+2. **`restore` no funcionaba en su caso de uso principal** (recuperación total con `sessions/` vacío): el backup implícito previo trataba el código 2 de `create` ("nada que respaldar") como un fallo duro. **Corregido**: acepta 0 o 2 como "seguir".
+3. **`make check` ya fallaba en `main` antes de tocar este plan** (2 `SC2181` preexistentes). **Corregido** en Task 2.
+4. **El bug de `set -e` perdiendo un código de retorno aparecía en dos sitios distintos**. **Corregido** en ambos con `rc=0; cmd || rc=$?`.
+5. `repair_events()` marcaba el header (`type:"session"`) con `ignorable:true`. **Corregido**: el header se excluye explícitamente.
+6. **`restore --from latest` podía restaurar el snapshot equivocado**: `latest` es un symlink que el propio backup implícito de `restore` re-apunta antes de que la copia real ocurra. Reproducido en sandbox. **Corregido**: `readlink -f` se aplica una sola vez, antes de tocar nada.
+7. **`repair` podía destruir en silencio la cola de un log con una escritura interrumpida**: `repair_events()` descomprimía con `zstd -dc` sin mirar el código de retorno — si el frame estaba truncado (`rc=1`), tomaba solo los datos parciales recuperados, los recomprimía, y publicaba eso in-place como si fuera el archivo completo. Reproducido con un artefacto truncado al 70%: `zstd -dc` da `rc=1` y 0 líneas recuperables, y sin el chequeo el comando habría "reparado" y publicado un archivo vacío reportando éxito. **Corregido**: `repair` ahora aborta si el artefacto está torn, en vez de proceder.
+8. **Los temporales de `repair` (`.repair-plain`, `.repair-tmp`) se creaban dentro de `$DSH_HOME/sessions/`**, violando el invariante de que nada temporal vive ahí — alcanza con que estén en el mismo filesystem (confirmado: mismo device id) para que `mv -T` siga siendo atómico. **Corregido**: se mueven a un scratch bajo `$DSH_BACKUP_ROOT`.
+9. **`plugins_remove()` reiniciaba `dsh.service` incondicionalmente**, sin importar qué profile se tocó. Confirmado leyendo el unit real generado por `service_install()`: `dsh.service` sirve siempre y únicamente el profile `web` (`PROFILE_DIR` fijo en el script del servicio) — no existe "un `dsh.service` por profile". Remover un paquete de un profile de prueba (ej. `repro`) no tiene ninguna razón para reiniciar producción. **Corregido**: el restart solo corre cuando `$profile = "web"`.
+10. **El label automático `preremove-<pkg>` podía quedar con un guión colgante** (`preremove-dsh-swarm-panel-`): `echo "$pkg" | tr -c ...` convierte el `\n` final de `echo` en un `-`. Reproducido. **Corregido**: `printf '%s'` en vez de `echo`.
+
+Todo el código de los fixes más críticos de esta v2 fue validado ejecutándolo en sandboxes descartables antes de escribirse en este documento.
 
 ---
 
 ## Global Constraints
 
-- Bash con `set -euo pipefail`; shellcheck limpio (`make check`).
+- Bash con `set -euo pipefail`; shellcheck limpio (`make check`) — **incluye sanear los 2 `SC2181` preexistentes**, ver Task 2.
 - Comentarios y salida al usuario en español.
-- **`restore` y `repair` son las únicas funciones que escriben bajo `$DSH_HOME/sessions/`.** Todo lo demás (`scan`, `create`, `list`, `verify`, `prune`) sigue siendo read-only ahí.
-- **`restore` y `repair` exigen DSH detenido** (spec §5.1 regla 5, §0.4 regla 2): sin excepción, sin override. Motivo verificado: el writer mantiene un fd en modo append; reemplazar el archivo por debajo pierde la escritura en silencio.
-- **`restore` y `repair` hacen `create` implícito** del estado actual antes de escribir (label `pre-restore-<timestamp>` / `pre-repair-<session>-<timestamp>`). Rollback siempre disponible.
-- **Escritura atómica**: `cp` a `<destino>.tmp` en el mismo directorio + `mv -T` al nombre final. Nunca escribir directo sobre el archivo que se está reemplazando.
-- **`repair` copia byte a byte lo que no toca** — nunca re-serializa JSON de líneas que no son el tipo a marcar (verificado en la práctica: re-serializar TODO cambia 6732 líneas sin motivo semántico).
-- Nombres de función y contrato JSON existentes (no romper): `dsh_session_lib_path()`, `session_backup_preflight()`, `DSH_BACKUP_ROOT`, `session_backup_verify_dir()`, contrato `sessions[].{workspace,directory,artifact,id,cwd,createdAt,events,risk,torn,unknownTypes}` de `MANIFEST.json`.
-- `DSH_MANAGE_VERSION` actual: `1.2.0` (línea 42 de `dsh-manage.sh`). Este plan la sube a `1.3.0` en la última tarea.
-- Interfaz declarada por el spec §1.1 para los subcomandos nuevos, implementada en las tareas correspondientes: `restore` (`--from`, `--session`, `--force`, `--to-new-id`), `repair` (`--session` obligatorio, `--mark-ignorable`, `--types`, `--yes`), `prune` (`--keep`, `--older-than`, `--yes`).
+- **`restore` y `repair` son las únicas funciones que escriben bajo `$DSH_HOME/sessions/`.** Todo lo demás sigue read-only ahí. **Ningún archivo temporal se crea bajo `sessions/`** — los temporales de `repair` viven en `$DSH_BACKUP_ROOT/.repair-scratch/` (mismo filesystem, `mv -T` sigue siendo atómico).
+- **`restore` y `repair` exigen DSH detenido, verificado dos veces**: al inicio y justo antes del `mv -T` final.
+- **`restore` y `repair` hacen `create` implícito** antes de escribir. Código de retorno: **0 o 2 → seguir**; cualquier otro → abortar.
+- **`--from <nombre>` se resuelve a una ruta absoluta con `readlink -f` ANTES de cualquier operación que pueda cambiar a qué apunta `latest`** (en particular, antes del backup implícito).
+- **`repair` aborta si el artefacto de origen está torn** (cola rota — `zstd -dc` con `returncode != 0`). Una cola rota "sigue siendo restaurable" para *lectura* (spec §5.2), pero `repair` *reescribe* el artefacto, y publicar solo el fragmento recuperado como si fuera el log completo sería pérdida de datos silenciosa. `repair_events()` debe propagar ese estado, no ignorarlo.
+- **Escritura atómica**: temporal en el mismo filesystem + `mv -T` al nombre final.
+- **`repair` copia byte a byte lo que no toca, y el header (`type:"session"`) nunca se toca**, sea cual sea el baseline.
+- **`--to-new-id` reescribe el `id` dentro del header JSON**, no solo el nombre del directorio — copiar el artefacto sin tocar el header produce una sesión que el harness rechaza al abrir o que colisiona en el listado.
+- **`--force` en `restore`**: si el destino existe y difiere del snapshot, **abortar sin `--force`**.
+- **Todo `cmd; rc=$?` bajo `set -e` es un bug** — usar siempre `rc=0; cmd || rc=$?`.
+- **`session_backup_guard()` es de solo lectura**: nunca escribe, nunca crea backups. Devuelve 0/1/3. No existe el código 2.
+- **`invalidate_projcache_entry()` usa igualdad exacta de `id`**, nunca `endswith`/prefijo.
+- **Ningún fallback de búsqueda de sesión usa `grep` sobre artefactos `.zstd`** — son binarios comprimidos.
+- **La validación previa a publicar un `repair` compara líneas y header contra el original**, no solo `zstd -t` (que valida el contenedor, no el contenido — verificado: un `.zstd` con basura adentro pasa `zstd -t` con rc=0).
+- Nombres de función y contrato JSON existentes (no romper): `dsh_session_lib_path()`, `session_backup_preflight()`, `DSH_BACKUP_ROOT`, `session_backup_verify_dir()`, `session_backup_create()`, `session_backup_scan()` (acepta **solo** `--profile <val>` y `--fail-on-risk`, nunca un posicional).
+- `DSH_MANAGE_VERSION` sube a `1.3.0` en la última tarea; el test existente que afirma `1.2.0` se actualiza en el mismo commit.
+- `read_stable_bytes()` / `--include-live`: **fuera de alcance de Fases 3-5**.
 
 ---
 
@@ -41,10 +59,9 @@
 
 | Archivo | Responsabilidad |
 |---|---|
-| `plugins/session-scan.py` (modificar) | Nuevas funciones puras: `read_stable_bytes()`, `repair_events()`. |
-| `dsh-manage.sh` (modificar) | `session_backup_restore()`, `session_backup_prune()`, `session_backup_repair()`, `session_backup_guard()` (gate compartido), `plugins_remove()` (nueva), hook en `plugins_install()`, `restart_dsh()` (extraída de `plugins_install`), `invalidate_projcache_entry()`. |
-| `plugins/manifest.json` (sin cambios de contenido — ya tiene `sessionEventWriters`) | Fuente de la lista de event-writers conocidos para el gate (además del escaneo dinámico). |
-| `tests/session-backup.bats` (modificar) | Tests de las 8 tareas. |
+| `plugins/session-scan.py` (modificar) | `repair_events()` (header excluido, aborta si torn), `find_session` (sin grep sobre binarios), `restore-plan`/`restore-new-id`. |
+| `dsh-manage.sh` (modificar) | `session_backup_restore()` (symlink resuelto antes del backup implícito), `session_backup_prune()` (protección por-sid), `session_backup_repair()` (temporales fuera de `sessions/`), `session_backup_guard()`, `plugins_remove()`, hook completo en `plugins_install()`, `restart_dsh()`, `invalidate_projcache_entry()`. |
+| `tests/session-backup.bats` (modificar) | Tests de las 7 tareas; el `SC2181` preexistente se corrige acá también. |
 | `README.md`, `CHANGELOG.md`, `dsh-manage.sh` (modificar) | Documentación y bump a 1.3.0. |
 
 ---
@@ -57,8 +74,8 @@
 - Test: `tests/session-backup.bats`
 
 **Interfaces:**
-- Consumes: `session_backup_preflight()`, `dsh_session_lib_path()`, `DSH_BACKUP_ROOT`, `session_backup_verify_dir()`, `session_backup_create()` (Fase 1+2, ya en `main`).
-- Produces: `port_pid_check()` (bash, wrapper de `port_pid()` existente que da mensaje claro), `session_backup_restore()` (bash), CLI `session-scan.py restore-plan --snap-dir <dir> --sessions <dir> [--session <id>]` → JSON con el plan de restauración (qué copiar, a dónde), sin ejecutar nada (el bash hace la copia real).
+- Consumes: `session_backup_preflight()`, `dsh_session_lib_path()`, `DSH_BACKUP_ROOT`, `session_backup_verify_dir()`, `session_backup_create()` (Fase 1+2).
+- Produces: `require_dsh_stopped()`, `session_backup_restore()`, `invalidate_projcache_entry()` (bash); CLI `session-scan.py restore-plan`/`restore-new-id` (Python).
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -70,26 +87,35 @@ Agregar a `tests/session-backup.bats`:
   fake_session "$DSH_HOME/sessions" "--ws-r1--" "session-r1" "session-r1" \
     '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r1
-  # DSH_PORT apuntando a un puerto donde SI hay algo escuchando (el propio bats
-  # no escucha nada, asi que forzamos con nc en background para simular "corriendo")
-  DSH_PORT=39217
-  ( exec 3<>/dev/tcp/127.0.0.1/1 ) 2>/dev/null || true  # no-op si /dev/tcp no disponible
   python3 -c "
-import socket
+import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.bind(('127.0.0.1', 39217))
 s.listen(1)
-import os
-if os.fork() == 0:
-    s.accept()
-else:
-    import time; time.sleep(0.3)
+time.sleep(2)
 " &
-  sleep 0.2
+  listener_pid=$!
+  sleep 0.3
   run env DSH_PORT=39217 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest
-  kill %1 2>/dev/null || true
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
   [ "$status" -ne 0 ]
   [[ "$output" == *"corriendo"* ]] || [[ "$output" == *"detene"* ]]
+}
+
+@test "restore --from latest restaura el snapshot que existia al invocar, no el backup implicito posterior" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r0--" "session-r0" "session-r0" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-bueno
+  printf 'ESTADO-ROTO' > "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd"
+  run env DSH_PORT=39227 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
+  [ "$status" -eq 0 ]
+  run zstd -t "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+  content="$(zstd -dc "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd")"
+  [[ "$content" != *"ESTADO-ROTO"* ]]
+  [[ "$content" == *'"type":"tipo/1"'* ]]
 }
 
 @test "restore sin DSH corriendo restaura una sesion desde el snapshot" {
@@ -97,58 +123,66 @@ else:
   fake_session "$DSH_HOME/sessions" "--ws-r2--" "session-r2" "session-r2" \
     '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r2
-  # simulamos que la sesion se corrompio despues del backup
   printf 'CORRUPTO' > "$DSH_HOME/sessions/--ws-r2--/session-r2/session.jsonl.zstd"
-  run env DSH_PORT=39218 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest
+  run env DSH_PORT=39218 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
   [ "$status" -eq 0 ]
-  # el archivo restaurado debe volver a ser el zstd valido, no la basura
   run zstd -t "$DSH_HOME/sessions/--ws-r2--/session-r2/session.jsonl.zstd"
   [ "$status" -eq 0 ]
 }
 
-@test "restore --session limita a una sola sesion" {
+@test "restore sin --force no pisa un destino que difiere" {
   install_fake_harness 48
-  fake_session "$DSH_HOME/sessions" "--ws-r3--" "session-r3a" "session-r3a" \
-    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
-  fake_session "$DSH_HOME/sessions" "--ws-r3--" "session-r3b" "session-r3b" \
+  fake_session "$DSH_HOME/sessions" "--ws-r3--" "session-r3" "session-r3" \
     '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r3
-  printf 'CORRUPTO-A' > "$DSH_HOME/sessions/--ws-r3--/session-r3a/session.jsonl.zstd"
-  printf 'CORRUPTO-B' > "$DSH_HOME/sessions/--ws-r3--/session-r3b/session.jsonl.zstd"
-  run env DSH_PORT=39219 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r3a
-  [ "$status" -eq 0 ]
-  run zstd -t "$DSH_HOME/sessions/--ws-r3--/session-r3a/session.jsonl.zstd"
-  [ "$status" -eq 0 ]
-  # r3b NO se toco, sigue corrupto
-  [ "$(cat "$DSH_HOME/sessions/--ws-r3--/session-r3b/session.jsonl.zstd")" = "CORRUPTO-B" ]
+  printf 'CORRUPTO' > "$DSH_HOME/sessions/--ws-r3--/session-r3/session.jsonl.zstd"
+  run env DSH_PORT=39222 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r3
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--force"* ]]
+  [ "$(cat "$DSH_HOME/sessions/--ws-r3--/session-r3/session.jsonl.zstd")" = "CORRUPTO" ]
 }
 
-@test "restore --to-new-id no pisa la sesion original" {
+@test "restore --session limita a una sola sesion" {
   install_fake_harness 48
-  fake_session "$DSH_HOME/sessions" "--ws-r4--" "session-r4" "session-r4" \
+  fake_session "$DSH_HOME/sessions" "--ws-r4--" "session-r4a" "session-r4a" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  fake_session "$DSH_HOME/sessions" "--ws-r4--" "session-r4b" "session-r4b" \
     '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r4
-  original_content="$(cat "$DSH_HOME/sessions/--ws-r4--/session-r4/session.jsonl.zstd")"
-  run env DSH_PORT=39220 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r4 --to-new-id
+  printf 'CORRUPTO-A' > "$DSH_HOME/sessions/--ws-r4--/session-r4a/session.jsonl.zstd"
+  printf 'CORRUPTO-B' > "$DSH_HOME/sessions/--ws-r4--/session-r4b/session.jsonl.zstd"
+  run env DSH_PORT=39219 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r4a --force
   [ "$status" -eq 0 ]
-  # la original sigue intacta
-  [ "$(cat "$DSH_HOME/sessions/--ws-r4--/session-r4/session.jsonl.zstd")" = "$original_content" ]
-  # y aparecio un directorio nuevo bajo el mismo workspace
-  count="$(find "$DSH_HOME/sessions/--ws-r4--" -mindepth 1 -maxdepth 1 -type d | wc -l)"
-  [ "$count" -eq 2 ]
+  run zstd -t "$DSH_HOME/sessions/--ws-r4--/session-r4a/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$DSH_HOME/sessions/--ws-r4--/session-r4b/session.jsonl.zstd")" = "CORRUPTO-B" ]
 }
 
-@test "restore hace backup implicito antes de escribir" {
+@test "restore --to-new-id reescribe el id del header, no solo el directorio" {
   install_fake_harness 48
   fake_session "$DSH_HOME/sessions" "--ws-r5--" "session-r5" "session-r5" \
     '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r5
-  before_count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' | wc -l)"
-  run env DSH_PORT=39221 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest
+  run env DSH_PORT=39220 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r5 --to-new-id
   [ "$status" -eq 0 ]
-  after_count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' | wc -l)"
-  # debe haber al menos un snapshot nuevo (el pre-restore automatico)
-  [ "$after_count" -gt "$before_count" ]
+  new_dir="$(find "$DSH_HOME/sessions/--ws-r5--" -mindepth 1 -maxdepth 1 -type d ! -name session-r5)"
+  [ -n "$new_dir" ]
+  new_id="$(zstd -dc "$new_dir/session.jsonl.zstd" | head -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  [ "$new_id" != "session-r5" ]
+  [[ "$new_id" == session-* ]]
+}
+
+@test "restore con sessions vacio no aborta por 'nada que respaldar' del backup implicito" {
+  install_fake_harness 48
+  mkdir -p "$DSH_BACKUP_ROOT"
+  fake_session "$DSH_HOME/sessions" "--ws-r6--" "session-r6" "session-r6" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-con-datos
+  rm -rf "${DSH_HOME:?}/sessions"
+  mkdir -p "$DSH_HOME/sessions"
+  run env DSH_PORT=39223 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
+  [ "$status" -eq 0 ]
+  [ -f "$DSH_HOME/sessions/--ws-r6--/session-r6/session.jsonl.zstd" ]
 }
 ```
 
@@ -157,14 +191,13 @@ else:
 Run: `cd /opt/dsh-manage && bats tests/session-backup.bats`
 Expected: FAIL — `restore` no es un subcomando válido.
 
-- [ ] **Step 3: Agregar `restore-plan` al helper Python**
+- [ ] **Step 3: Agregar `restore-plan` y la reescritura de header al helper Python**
 
 Agregar a `plugins/session-scan.py`, antes de `main()`:
 
 ```python
 def cmd_restore_plan(args):
-    """Calcula que copiar para un restore, sin ejecutar nada. El bash hace la
-    copia real (mas facil de auditar y de mantener atomica desde shell)."""
+    """Calcula que copiar para un restore, sin ejecutar nada."""
     manifest_path = os.path.join(args.snap_dir, "MANIFEST.json")
     with open(manifest_path, encoding="utf-8") as f:
         manifest = json.load(f)
@@ -181,6 +214,31 @@ def cmd_restore_plan(args):
         raise SystemExit(f"la sesion '{args.session}' no esta en este snapshot")
     json.dump({"restores": plan}, sys.stdout, indent=2)
     print()
+
+
+def rewrite_header_id(src_path, new_id):
+    """Devuelve el contenido con el id del header (primera linea) reescrito.
+    Las demas lineas se preservan byte a byte -- copiar el artefacto sin
+    tocar el header produce una sesion que el harness rechaza al abrir
+    (assertStoredIdentity compara la ruta con meta.id/meta.cwd del header)."""
+    if src_path.endswith(".zstd"):
+        raw = subprocess.run(["zstd", "-dc", src_path], capture_output=True).stdout.decode("utf-8", errors="replace")
+    else:
+        with open(src_path, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    lines = raw.splitlines()
+    if not lines:
+        raise SystemExit(f"artefacto vacio: {src_path}")
+    header = json.loads(lines[0])
+    header["id"] = new_id
+    lines[0] = json.dumps(header, ensure_ascii=False)
+    return "\n".join(lines) + "\n"
+
+
+def cmd_restore_new_id(args):
+    content = rewrite_header_id(args.artifact, args.new_id)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(content)
 ```
 
 y su registro en `main()`:
@@ -191,6 +249,12 @@ y su registro en `main()`:
     p.add_argument("--sessions", required=True)
     p.add_argument("--session", default=None, help="limitar a una sesion (id o directory)")
     p.set_defaults(func=cmd_restore_plan)
+
+    p = sub.add_parser("restore-new-id", help="reescribe el id del header (uso interno)")
+    p.add_argument("--artifact", required=True)
+    p.add_argument("--new-id", required=True)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_restore_new_id)
 ```
 
 - [ ] **Step 4: Agregar `restore` en bash**
@@ -198,9 +262,8 @@ y su registro en `main()`:
 En `dsh-manage.sh`, agregar después de `session_backup_verify()`:
 
 ```bash
-# Espera opcional con timeout de que el puerto quede libre; NO se usa para
-# esperar a que arranque (eso es wait_for_port), sino para el chequeo
-# obligatorio de restore/repair.
+# Chequeo obligatorio antes de restore/repair. Se llama DOS VECES: al inicio
+# (falla rapido) y de nuevo justo antes del mv -T final.
 require_dsh_stopped() {
   local pid
   pid="$(port_pid)"
@@ -212,9 +275,35 @@ require_dsh_stopped() {
   fi
 }
 
-# restore: copia sesiones desde un snapshot de vuelta a sessions/. La UNICA
-# funcion de session-backup (junto con repair) que escribe ahi. Por eso:
-# backup implicito antes, DSH detenido sin excepcion, escritura atomica.
+# Invalida la entrada de una sesion en session_projcache.json. Igualdad
+# EXACTA de id -- este host tiene ids con y sin el prefijo "session-"
+# coexistiendo, y un match por endswith/prefijo puede borrar de mas.
+invalidate_projcache_entry() {
+  local session_id="$1"
+  local cache="$DSH_HOME/storages/session_projcache.json"
+  [ -f "$cache" ] || return 0
+  python3 -c "
+import json, os, sys
+path = sys.argv[1]
+sid = sys.argv[2]
+with open(path, encoding='utf-8') as f:
+    d = json.load(f)
+sessions = d.get('tables', {}).get('sessions', {})
+if sid not in sessions:
+    sys.exit(0)
+del sessions[sid]
+tmp = path + '.tmp'
+old_umask = os.umask(0o077)
+try:
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f)
+finally:
+    os.umask(old_umask)
+os.replace(tmp, path)
+" "$cache" "$session_id"
+}
+
+# restore: copia sesiones desde un snapshot de vuelta a sessions/.
 session_backup_restore() {
   local from="latest" session="" force=0 to_new_id=0
   while [ $# -gt 0 ]; do
@@ -235,15 +324,24 @@ session_backup_restore() {
   require_dsh_stopped || return 1
 
   local snap="$DSH_BACKUP_ROOT/$from"
-  [ -d "$snap" ] || { echo "snapshot no encontrado: $snap" >&2; return 1; }
+  [ -e "$snap" ] || { echo "snapshot no encontrado: $snap" >&2; return 1; }
+  # CRITICO: resolver el symlink a una ruta ABSOLUTA REAL ahora, antes de
+  # tocar nada. "latest" es un symlink que session_backup_create() (el
+  # backup implicito de mas abajo) va a re-apuntar al terminar -- si $snap
+  # siguiera siendo la ruta "via latest" en vez de la ruta resuelta, el
+  # resto de esta funcion leeria el backup implicito recien creado en vez
+  # del snapshot original.
+  snap="$(readlink -f "$snap")"
+  [ -d "$snap" ] || { echo "snapshot no encontrado tras resolver: $snap" >&2; return 1; }
   session_backup_verify_dir "$snap" || { echo "snapshot invalido, abortando restore" >&2; return 1; }
 
-  # Backup implicito del estado actual ANTES de escribir. Reusa create().
   echo "creando backup del estado actual antes de restaurar..."
-  session_backup_create --label "pre-restore-$(date -u +%Y%m%dT%H%M%SZ)" || {
-    echo "fallo el backup previo; abortando restore sin tocar nada" >&2
+  local backup_rc=0
+  session_backup_create --label "pre-restore-$(date -u +%Y%m%dT%H%M%SZ)" || backup_rc=$?
+  if [ "$backup_rc" -ne 0 ] && [ "$backup_rc" -ne 2 ]; then
+    echo "fallo el backup previo (rc=$backup_rc); abortando restore sin tocar nada" >&2
     return 1
-  }
+  fi
 
   umask 077
   local sessions_dir="$DSH_HOME/sessions"
@@ -253,66 +351,57 @@ session_backup_restore() {
   plan="$(python3 "${plan_args[@]}")" || return 1
 
   local count=0
-  while IFS=$'\t' read -r src dst directory; do
+  while IFS=$'\t' read -r src dst directory sid; do
     [ -n "$src" ] || continue
+
     if [ "$to_new_id" -eq 1 ]; then
-      local new_dir
-      new_dir="$(cd "$(dirname "$dst")/.." && pwd)/session-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+      local new_dir new_id
+      new_id="session-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+      new_dir="$(cd "$(dirname "$dst")/.." && pwd)/$new_id"
       mkdir -p "$new_dir"
-      dst="$new_dir/$(basename "$dst")"
+      local rewritten="$new_dir/$(basename "$dst")"
+      local tmp_plain="${rewritten}.plain"
+      python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" restore-new-id \
+        --artifact "$src" --new-id "$new_id" --out "$tmp_plain" || { rm -f "$tmp_plain"; return 1; }
+      if [[ "$rewritten" == *.zstd ]]; then
+        zstd -q -f -o "$rewritten" "$tmp_plain" || { rm -f "$tmp_plain" "$rewritten"; return 1; }
+        rm -f "$tmp_plain"
+      else
+        mv -T "$tmp_plain" "$rewritten"
+      fi
+      count=$((count + 1))
+      continue
     fi
-    if [ -e "$dst" ] && [ "$force" -eq 0 ] && [ "$to_new_id" -eq 0 ]; then
+
+    if [ -e "$dst" ]; then
       local cur_sum snap_sum
       cur_sum="$(sha256sum "$dst" | cut -d' ' -f1)"
       snap_sum="$(sha256sum "$src" | cut -d' ' -f1)"
       if [ "$cur_sum" = "$snap_sum" ]; then
-        continue  # ya identico, nada que hacer
+        continue
+      fi
+      if [ "$force" -ne 1 ]; then
+        echo "'$dst' existe y difiere del snapshot; use --force para pisarlo" >&2
+        return 1
       fi
     fi
+
+    require_dsh_stopped || { echo "dsh arranco durante el restore; abortando antes de escribir $dst" >&2; return 1; }
+
     mkdir -p "$(dirname "$dst")"
     local tmp="${dst}.restore-tmp"
     cp "$src" "$tmp"
     mv -T "$tmp" "$dst"
-    invalidate_projcache_entry "$directory" || true
+    invalidate_projcache_entry "$sid" || true
     count=$((count + 1))
   done < <(python3 -c "
 import json, sys
 d = json.loads(sys.argv[1])
 for r in d['restores']:
-    print(f\"{r['src']}\t{r['dst']}\t{r['directory']}\")
+    print(f\"{r['src']}\t{r['dst']}\t{r['directory']}\t{r['id']}\")
 " "$plan")
 
   echo "restore completo: $count archivo(s) restaurado(s) desde $snap"
-}
-
-# Invalida la entrada de una sesion en la cache de proyeccion derivada
-# (session_projcache.json). No-op silencioso si el archivo o la clave no
-# existen -- la cache se repuebla sola. Ver spec S7.2.
-invalidate_projcache_entry() {
-  local session_id="$1"
-  local cache="$DSH_HOME/storages/session_projcache.json"
-  [ -f "$cache" ] || return 0
-  python3 -c "
-import json, os, sys
-path = sys.argv[1]
-sid = sys.argv[2]
-with open(path, encoding='utf-8') as f:
-    d = json.load(f)
-sessions = d.get('tables', {}).get('sessions', {})
-if sid not in sessions and not any(k.endswith(sid) or sid.endswith(k) for k in sessions):
-    sys.exit(0)
-keys_to_drop = [k for k in sessions if k == sid or k.endswith(sid) or sid.endswith(k)]
-for k in keys_to_drop:
-    del sessions[k]
-tmp = path + '.tmp'
-old_umask = os.umask(0o077)
-try:
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(d, f)
-finally:
-    os.umask(old_umask)
-os.replace(tmp, path)
-" "$cache" "$session_id"
 }
 ```
 
@@ -326,42 +415,42 @@ y su línea de uso a `{scan|create|list|verify|restore}`.
 - [ ] **Step 5: Correr los tests para ver que pasan**
 
 Run: `cd /opt/dsh-manage && bats tests/session-backup.bats && make check`
-Expected: PASS + shellcheck limpio. Nota: el test de "exige DSH detenido" depende de que el bind a un puerto Python funcione en el sandbox de test — si `/dev/tcp` o el bind fallan por restricciones del entorno CI, el test debe saltearse con `skip` en vez de fallar falso-negativo; ajustar si hace falta pero mantener la assertion de fondo (rc≠0 con DSH corriendo).
+Expected: PASS. `make check` no quedará limpio todavía (Task 2 sanea los preexistentes). Confirmar sin warnings nuevos en `dsh-manage.sh`.
 
 - [ ] **Step 6: Verificar contra el host real (con cuidado — toca sesiones reales)**
-
-**No correr `restore` contra el `$HOME/.dsh` real sin haber detenido `dsh.service` primero**, y solo con un snapshot de prueba, nunca reemplazando una sesión real sin backup fresco:
 
 ```bash
 cd /opt/dsh-manage
 ./dsh-manage.sh session-backup create --label antes-de-probar-restore
+snap_fuente="$(basename "$(readlink -f "$HOME/.dsh/session-backups/latest")")"
 systemctl stop dsh.service
-./dsh-manage.sh session-backup restore --from latest --session <un-id-de-sesion-de-prueba>
+./dsh-manage.sh session-backup restore --from "$snap_fuente" --session <un-id-de-sesion-de-prueba> --force
 systemctl start dsh.service
-./dsh-manage.sh session-backup verify --from latest
+./dsh-manage.sh session-backup verify --from "$snap_fuente"
 ```
-Expected: `restore completo: N archivo(s) restaurado(s)`, el servicio vuelve a levantar (`wait_for_port` implícito al reiniciar). Si algo sale mal, el snapshot `antes-de-probar-restore` permite volver atrás con otro `restore`.
+Expected: `restore completo: N archivo(s) restaurado(s)`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add plugins/session-scan.py dsh-manage.sh tests/session-backup.bats
-git commit -m "feat(session-backup): subcomando restore"
+git commit -m "feat(session-backup): subcomando restore, con resolucion de symlink previa al backup implicito"
 ```
 
 ---
 
-### Task 2: `prune`
+### Task 2: `prune` (protección por-sesión, y saneo del shellcheck heredado)
 
 **Files:**
 - Modify: `dsh-manage.sh`
+- Modify: `tests/session-backup.bats`
 - Test: `tests/session-backup.bats`
 
-**Interfaces:**
-- Consumes: `DSH_BACKUP_ROOT`, formato de nombre de snapshot (`<UTC>-<label>`, ordena lexicográficamente = cronológicamente).
-- Produces: `session_backup_prune()`.
+- [ ] **Step 1: Sanear los `SC2181` preexistentes**
 
-- [ ] **Step 1: Escribir los tests que fallan**
+`make check` en `main` ya falla hoy por 2 warnings en `tests/session-backup.bats` (patrón `[ "$?" -eq 0 ]`). Buscar con `grep -n '\$?'` y refactorizar al patrón `run comando; [ "$status" -eq 0 ]`. Confirmar con `shellcheck tests/session-backup.bats`.
+
+- [ ] **Step 2: Escribir los tests que fallan**
 
 Agregar a `tests/session-backup.bats`:
 
@@ -376,7 +465,7 @@ Agregar a `tests/session-backup.bats`:
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1
   [ "$status" -ne 0 ]
   [[ "$output" == *"--yes"* ]]
-  count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' ! -name "$(basename "$DSH_BACKUP_ROOT")" | wc -l)"
+  count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' ! -path "$DSH_BACKUP_ROOT" | wc -l)"
   [ "$count" -eq 2 ]
 }
 
@@ -387,55 +476,70 @@ Agregar a `tests/session-backup.bats`:
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label viejo
   sleep 1.1
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label nuevo
+  viejo_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-viejo)"
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1 --yes
   [ "$status" -eq 0 ]
-  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup list
-  [[ "$output" == *"nuevo"* ]]
-  [[ "$output" != *"viejo"* ]]
+  [ ! -d "$viejo_dir" ]
+  ls -d "$DSH_BACKUP_ROOT"/*-nuevo
 }
 
-@test "prune nunca borra el unico backup de una sesion broken" {
+@test "prune nunca borra la unica copia de una sesion broken, incluso compartiendo snapshot con otra cubierta" {
   install_fake_harness 48
-  # sesion con un tipo desconocido sin dueno -> broken
-  fake_session "$DSH_HOME/sessions" "--ws-p3--" "session-p3" "session-p3" \
-    '{"type":"foo/inventado","seq":1,"time":1,"data":{}}'
-  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label unico-broken
+  fake_session "$DSH_HOME/sessions" "--ws-p3--" "session-S1" "session-S1" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  fake_session "$DSH_HOME/sessions" "--ws-p3--" "session-S2" "session-S2" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-A
+  a_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-snap-A)"
+  sleep 1.1
+  rm -rf "$DSH_HOME/sessions/--ws-p3--/session-S2"
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-B
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 0 --yes
   [ "$status" -eq 0 ]
-  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup list
-  [[ "$output" == *"unico-broken"* ]]
+  [ -d "$a_dir" ]
+}
+
+@test "prune borra sin protegerse de mas cuando la sesion SI tiene otra copia" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p4--" "session-S1" "session-S1" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-A
+  a_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-snap-A)"
+  sleep 1.1
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-B
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1 --yes
+  [ "$status" -eq 0 ]
+  [ ! -d "$a_dir" ]
 }
 
 @test "prune --older-than borra por edad" {
   install_fake_harness 48
-  fake_session "$DSH_HOME/sessions" "--ws-p4--" "session-p4" "session-p4" \
+  fake_session "$DSH_HOME/sessions" "--ws-p5--" "session-p5" "session-p5" \
     '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label reciente
-  # forzamos un snapshot "viejo" renombrando el directorio con timestamp antiguo
   snap="$(ls -d "$DSH_BACKUP_ROOT"/*-reciente)"
   viejo="$DSH_BACKUP_ROOT/20200101T000000Z-viejo-de-verdad"
   cp -r "$snap" "$viejo"
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --older-than 30 --yes
   [ "$status" -eq 0 ]
-  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup list
-  [[ "$output" != *"viejo-de-verdad"* ]]
-  [[ "$output" == *"reciente"* ]]
+  [ ! -d "$viejo" ]
+  [ -d "$snap" ]
 }
 ```
 
-- [ ] **Step 2: Correr los tests para ver que fallan**
+- [ ] **Step 3: Correr los tests para ver que fallan**
 
 Run: `cd /opt/dsh-manage && bats tests/session-backup.bats`
 Expected: FAIL — `prune` no es un subcomando válido.
 
-- [ ] **Step 3: Escribir la implementación**
+- [ ] **Step 4: Escribir la implementación**
 
 Agregar a `dsh-manage.sh`, después de `session_backup_restore()`:
 
 ```bash
-# prune: borra snapshots viejos por retencion. NUNCA escribe bajo sessions/;
-# solo borra directorios de snapshot. Nunca borra el UNICO backup que cubre
-# una sesion broken (perderia la unica copia recuperable).
+# prune: borra snapshots viejos por retencion. Proteccion POR SESION, no por
+# snapshot: procesa de mas viejo a mas nuevo, considerando "sobrevivientes"
+# a todo lo que no fue decidido a borrar TODAVIA en esta misma pasada.
 session_backup_prune() {
   local keep=10 older_than="" yes=0
   while [ $# -gt 0 ]; do
@@ -452,28 +556,23 @@ session_backup_prune() {
   done
 
   if [ "$yes" -ne 1 ]; then
-    echo "prune requiere --yes para borrar de verdad (dry-run no implementado en esta version)" >&2
+    echo "prune requiere --yes para borrar de verdad" >&2
     return 1
   fi
 
   [ -d "$DSH_BACKUP_ROOT" ] || { echo "no hay snapshots ($DSH_BACKUP_ROOT no existe)"; return 0; }
 
-  # Candidatos: directorios completos (no .partial, no 'latest'), orden
-  # cronologico por nombre (UTC ISO basico ordena lexicograficamente).
-  local candidates=()
-  local dir
+  local candidates=() dir
   for dir in "$DSH_BACKUP_ROOT"/*/; do
     [ -d "$dir" ] || continue
     case "${dir%/}" in *.partial|*/latest) continue ;; esac
     [ -f "${dir}MANIFEST.json" ] || continue
     candidates+=("${dir%/}")
   done
-  IFS=$'\n' candidates=($(printf '%s\n' "${candidates[@]}" | sort))
-  unset IFS
+  mapfile -t candidates < <(printf '%s\n' "${candidates[@]}" | sort)
 
   local total=${#candidates[@]}
   local to_delete=()
-  local i
   if [ -n "$older_than" ]; then
     local cutoff
     cutoff="$(date -u -d "-${older_than} days" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u -v-"${older_than}"d +%Y%m%dT%H%M%SZ)"
@@ -483,59 +582,64 @@ session_backup_prune() {
     done
   else
     if [ "$total" -gt "$keep" ]; then
-      local n_delete=$((total - keep))
+      local n_delete=$((total - keep)) i
       for ((i = 0; i < n_delete; i++)); do
         to_delete+=("${candidates[$i]}")
       done
     fi
   fi
 
-  local deleted=0 protected=0
+  local deleted=0 protected=0 final_delete=()
   for dir in "${to_delete[@]}"; do
-    local has_broken
-    has_broken="$(python3 -c "
+    local cur_survivors=() c
+    for c in "${candidates[@]}"; do
+      [ "$c" = "$dir" ] && continue
+      local already_deleted=0 fd
+      for fd in "${final_delete[@]}"; do [ "$fd" = "$c" ] && already_deleted=1; done
+      [ "$already_deleted" -eq 1 ] && continue
+      cur_survivors+=("$c")
+    done
+
+    local can_delete=1
+    local broken_sids
+    broken_sids="$(python3 -c "
 import json
 try:
     m = json.load(open('$dir/MANIFEST.json'))
 except Exception:
-    print('0'); raise SystemExit
-print('1' if any(s.get('risk') == 'broken' for s in m.get('sessions', [])) else '0')
-")"
-    if [ "$has_broken" = "1" ]; then
-      # Es el unico backup de una sesion broken si ningun OTRO snapshot
-      # sobreviviente (fuera de to_delete) tiene la misma sesion.
-      local sid unique=1
-      for sid in $(python3 -c "
-import json
-m = json.load(open('$dir/MANIFEST.json'))
-print(' '.join(s['id'] for s in m['sessions'] if s.get('risk') == 'broken'))
-"); do
-        local other
-        for other in "${candidates[@]}"; do
-          [ "$other" = "$dir" ] && continue
-          local will_delete=0 d2
-          for d2 in "${to_delete[@]}"; do [ "$d2" = "$other" ] && will_delete=1; done
-          [ "$will_delete" -eq 1 ] && continue
+    raise SystemExit
+print(' '.join(s['id'] for s in m.get('sessions', []) if s.get('risk') == 'broken'))
+" 2>/dev/null)"
+    if [ -n "$broken_sids" ]; then
+      local sid
+      for sid in $broken_sids; do
+        local covered=0 other
+        for other in "${cur_survivors[@]}"; do
           if python3 -c "
 import json, sys
 m = json.load(open('$other/MANIFEST.json'))
 sys.exit(0 if any(s['id'] == '$sid' for s in m['sessions']) else 1)
 " 2>/dev/null; then
-            unique=0
+            covered=1
           fi
         done
+        if [ "$covered" -eq 0 ]; then
+          can_delete=0
+        fi
       done
-      if [ "$unique" -eq 1 ]; then
-        protected=$((protected + 1))
-        echo "protegido (unico backup de sesion broken): $(basename "$dir")"
-        continue
-      fi
     fi
-    rm -rf -- "$dir"
-    deleted=$((deleted + 1))
+
+    if [ "$can_delete" -eq 1 ]; then
+      final_delete+=("$dir")
+      rm -rf -- "$dir"
+      deleted=$((deleted + 1))
+    else
+      protected=$((protected + 1))
+      echo "protegido (unica copia de al menos una sesion broken): $(basename "$dir")"
+    fi
   done
 
-  echo "prune: $deleted snapshot(s) borrado(s), $protected protegido(s) por ser el unico backup de una sesion broken"
+  echo "prune: $deleted snapshot(s) borrado(s), $protected protegido(s) por ser la unica copia de una sesion broken"
 }
 ```
 
@@ -546,39 +650,42 @@ Ampliar el despachador:
 ```
 y su línea de uso a `{scan|create|list|verify|restore|prune}`.
 
-- [ ] **Step 4: Correr los tests para ver que pasan**
+- [ ] **Step 5: Correr los tests para ver que pasan**
 
 Run: `cd /opt/dsh-manage && bats tests/session-backup.bats && make check`
-Expected: PASS + shellcheck limpio.
+Expected: PASS + `make check` limpio de verdad.
 
-- [ ] **Step 5: Verificar contra el host real**
+- [ ] **Step 6: Verificar contra el host real**
 
 ```bash
 cd /opt/dsh-manage
-./dsh-manage.sh session-backup list
+before="$(./dsh-manage.sh session-backup list)"
 ./dsh-manage.sh session-backup prune --keep 5 --yes
-./dsh-manage.sh session-backup list
+after="$(./dsh-manage.sh session-backup list)"
+diff <(echo "$before") <(echo "$after") || true
 ```
-Expected: conserva los 5 snapshots más recientes (o los que haya si son menos), protege cualquiera que sea el único backup de una sesión `broken`.
+Expected: conserva los 5 más recientes; cualquier `broken` sin otra copia queda listado como "protegido".
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add dsh-manage.sh tests/session-backup.bats
-git commit -m "feat(session-backup): subcomando prune"
+git commit -m "feat(session-backup): subcomando prune, con proteccion por-sesion (no por-snapshot)"
 ```
 
 ---
 
-### Task 3: `session_backup_guard` (gate compartido)
+### Task 3: `session_backup_guard` (gate compartido, contrato read-only)
 
 **Files:**
 - Modify: `dsh-manage.sh`
 - Test: `tests/session-backup.bats`
 
 **Interfaces:**
-- Consumes: `session_backup_scan()`, `session_backup_create()`, `scan_plugin_vocabulary()` (vía `session-scan.py`).
-- Produces: `session_backup_guard()` — función de biblioteca (no subcomando de usuario), pensada para que `plugins_install()`/`plugins_remove()` la invoquen.
+- Consumes: `session_backup_scan()` (con `--profile`, nunca posicional), `scan_plugin_vocabulary()` vía `session-scan.py`.
+- Produces: `session_backup_guard()`.
+
+**Contrato**: solo lectura. `0` sin impacto; `1` error duro (llamador aborta); `3` impacto detectado (el llamador decide backup+confirmación). No existe el código `2`.
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -591,10 +698,9 @@ Agregar a `tests/session-backup.bats`:
   fake_plugin "$nm" "plugin-guard-test" "guard/evento"
   fake_session "$DSH_HOME/sessions" "--ws-g1--" "session-g1" "session-g1" \
     '{"type":"guard/evento","seq":1,"time":1,"data":{}}'
-  source <(sed -n '/^session_backup_preflight/,/^}/p; /^dsh_session_lib_path/,/^}/p; /^session_backup_guard/,/^}/p' "$BATS_TEST_DIRNAME/../dsh-manage.sh")
-  export DSH_PREFIX="$DSH_NODE/.." DSH_PKG="@deepseek-ai/dsh" DSH_MANAGE_DIR="$BATS_TEST_DIRNAME/.."
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
   run session_backup_guard remove "$nm/plugin-guard-test" web
-  [ "$status" -eq 3 ]  # 3 = hay sesiones que pasarian a broken
+  [ "$status" -eq 3 ]
   [[ "$output" == *"session-g1"* ]] || [[ "$output" == *"1"* ]]
 }
 
@@ -602,10 +708,23 @@ Agregar a `tests/session-backup.bats`:
   install_fake_harness 48
   nm="$BATS_TEST_TMPDIR/nm-guard2"
   fake_plugin "$nm" "plugin-sin-uso" "sinuso/evento"
-  source <(sed -n '/^session_backup_preflight/,/^}/p; /^dsh_session_lib_path/,/^}/p; /^session_backup_guard/,/^}/p' "$BATS_TEST_DIRNAME/../dsh-manage.sh")
-  export DSH_PREFIX="$DSH_NODE/.." DSH_PKG="@deepseek-ai/dsh" DSH_MANAGE_DIR="$BATS_TEST_DIRNAME/.."
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
   run session_backup_guard remove "$nm/plugin-sin-uso" web
   [ "$status" -eq 0 ]
+}
+
+@test "session_backup_guard nunca escribe nada (es read-only)" {
+  install_fake_harness 48
+  nm="$BATS_TEST_TMPDIR/nm-guard3"
+  fake_plugin "$nm" "plugin-guard-ro" "guardro/evento"
+  fake_session "$DSH_HOME/sessions" "--ws-g3--" "session-g3" "session-g3" \
+    '{"type":"guardro/evento","seq":1,"time":1,"data":{}}'
+  before="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" -type f 2>/dev/null | sort)"
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard remove "$nm/plugin-guard-ro" web
+  [ "$status" -eq 3 ]
+  after="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" -type f 2>/dev/null | sort)"
+  [ "$before" = "$after" ]
 }
 ```
 
@@ -619,15 +738,8 @@ Expected: FAIL — `session_backup_guard` no existe.
 Agregar a `dsh-manage.sh`, después de `session_backup_prune()`:
 
 ```bash
-# Gate compartido invocado por plugins_install()/plugins_remove(). Calcula el
-# impacto de instalar/remover un paquete sobre las sesiones existentes.
-# Devuelve por stdout un resumen legible y por exit code:
-#   0 = sin impacto, seguir sin backup
-#   2 = impacto detectado, backup ya hecho (create automatico corrido adentro)
-#   3 = impacto detectado y es indispensable confirmar antes de seguir
-# accion: "install" | "remove". pkg_dir: directorio del paquete (para leer su
-# lib/*.js y extraer vocabulario, igual que scan_plugin_vocabulary). profile:
-# nombre del profile afectado.
+# Gate compartido, READ-ONLY. Contrato: 0=sin impacto, 1=error duro,
+# 3=impacto detectado (el LLAMADOR decide backup+confirmacion).
 session_backup_guard() {
   local accion="$1" pkg_dir="$2" profile="$3"
   session_backup_preflight || return 1
@@ -635,11 +747,9 @@ session_backup_guard() {
   local sessions_dir="$DSH_HOME/sessions"
   [ -d "$sessions_dir" ] || return 0
 
-  # Vocabulario del paquete en cuestion, aislado (no todo node_modules).
   local pkg_types
   pkg_types="$(python3 - "$pkg_dir" <<'PY'
-import sys, os, re, json
-sys.path.insert(0, os.environ.get("DSH_MANAGE_DIR", ".") + "/plugins")
+import sys, os, re
 APPEND_LITERAL = re.compile(r'append\(\s*"([a-z][a-z0-9-]*/[a-z0-9/-]+)"')
 VOCAB_MARKER = "KNOWN_SESSION_EVENT_TYPES"
 pkg_dir = sys.argv[1]
@@ -660,9 +770,10 @@ if os.path.isdir(lib):
             types.update(APPEND_LITERAL.findall(src))
 print("\n".join(sorted(types)))
 PY
-)"
+)" || return 1
+
   if [ -z "$pkg_types" ]; then
-    return 0  # el paquete no declara vocabulario: sin impacto posible
+    return 0
   fi
 
   local scan_args=(
@@ -680,22 +791,15 @@ PY
 import json, sys
 scan = json.loads(sys.argv[1])
 pkg_types = set(sys.argv[2].splitlines())
-accion = sys.argv[3]
 hits = []
 for s in scan['sessions']:
     types_here = {u['type'] for u in s.get('unknownTypes', [])}
-    if accion == 'remove':
-        # tipos que este paquete DECLARA y esta sesion USA -> pasarian a broken
-        if types_here & pkg_types:
-            hits.append(s['id'])
-    else:
-        # instalar/actualizar: riesgo menor, mismo chequeo hoy
-        if types_here & pkg_types:
-            hits.append(s['id'])
+    if types_here & pkg_types:
+        hits.append(s['id'])
 print(len(hits))
 for h in hits:
     print(h)
-" "$scan_json" "$pkg_types" "$accion")"
+" "$scan_json" "$pkg_types")"
 
   local n_affected
   n_affected="$(echo "$affected" | head -1)"
@@ -705,7 +809,6 @@ for h in hits:
 
   echo "⚠ esta operacion ($accion) afecta a $n_affected sesion(es):"
   echo "$affected" | tail -n +2 | sed 's/^/    /'
-  echo "$scan_json" > "${DSH_BACKUP_ROOT:-$DSH_HOME/session-backups}/.last-guard-scan.json.tmp" 2>/dev/null || true
   return 3
 }
 ```
@@ -719,7 +822,7 @@ Expected: PASS + shellcheck limpio.
 
 ```bash
 git add dsh-manage.sh tests/session-backup.bats
-git commit -m "feat(session-backup): gate compartido session_backup_guard"
+git commit -m "feat(session-backup): gate compartido session_backup_guard (read-only, contrato 0/1/3)"
 ```
 
 ---
@@ -731,10 +834,8 @@ git commit -m "feat(session-backup): gate compartido session_backup_guard"
 - Test: `tests/session-backup.bats`
 
 **Interfaces:**
-- Consumes: `session_backup_guard()` (Task 3), `session_backup_create()`, `port_pid()`/`wait_for_port()` (ya existen), `dsh_service_manages_this_home()` (ya existe).
-- Produces: `restart_dsh()` (extraída del bloque duplicado que hoy vive dentro de `plugins_install()`), `plugins_remove()`, dispatcher `plugins-remove`.
-
-> ⚠️ **Esta es la tarea más sensible de todo este plan.** `plugins_remove()` reinicia `dsh.service` — a diferencia del patch de `dsh-swarm-panel` en la v1 de Fase 1+2 (que era un no-op inútil), acá el restart es necesario y tiene efecto real. Mitigaciones obligatorias: backup automático antes, confirmación explícita (aborta sin `--yes` y sin TTY), verificación post-restart igual que `plugins_install` ya hace.
+- Consumes: `session_backup_guard()` (Task 3), `session_backup_create()`, `port_pid()`/`wait_for_port()`, `dsh_service_manages_this_home()`.
+- Produces: `restart_dsh()`, `plugins_remove()`, dispatcher `plugins-remove`.
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
@@ -743,17 +844,52 @@ Agregar a `tests/session-backup.bats`:
 ```bash
 @test "plugins_remove sin --yes y sin TTY aborta sin tocar nada" {
   install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/web/node_modules/paquete-inexistente"
+  cat > "$DSH_HOME/profiles/web/package.json" <<'EOF'
+{"name":"web","dependencies":{"paquete-inexistente":"1.0.0"}}
+EOF
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-inexistente web < /dev/null
   [ "$status" -ne 0 ]
   [[ "$output" == *"--yes"* ]] || [[ "$output" == *"TTY"* ]]
 }
 
-@test "plugins_remove con --yes pero paquete no instalado falla limpio" {
+@test "plugins_remove con paquete no declarado en package.json falla limpio" {
   install_fake_harness 48
   mkdir -p "$DSH_HOME/profiles/web"
   echo '{"name":"web","dependencies":{}}' > "$DSH_HOME/profiles/web/package.json"
   run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-que-no-existe web --yes
   [ "$status" -ne 0 ]
+}
+
+@test "guard_rc se captura correctamente bajo set -e (no se pierde con impacto detectado)" {
+  install_fake_harness 48
+  nm="$DSH_HOME/profiles/web/node_modules"
+  mkdir -p "$nm/plugin-con-impacto/lib"
+  cat > "$nm/plugin-con-impacto/package.json" <<'EOF'
+{"name":"plugin-con-impacto","version":"1.0.0"}
+EOF
+  cat > "$nm/plugin-con-impacto/lib/index.js" <<'EOF'
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+export function emit(s) { s.append("impacto/evento", {}); }
+EOF
+  cat > "$DSH_HOME/profiles/web/package.json" <<'EOF'
+{"name":"web","dependencies":{"plugin-con-impacto":"1.0.0"}}
+EOF
+  fake_session "$DSH_HOME/sessions" "--ws-gr--" "session-gr" "session-gr" \
+    '{"type":"impacto/evento","seq":1,"time":1,"data":{}}'
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove plugin-con-impacto web --yes
+  [[ "$output" == *"backup automatico"* ]]
+}
+
+@test "plugins_remove no reinicia dsh.service al tocar un profile que no es web" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/repro/node_modules/paquete-en-repro"
+  cat > "$DSH_HOME/profiles/repro/package.json" <<'EOF'
+{"name":"repro","dependencies":{"paquete-en-repro":"1.0.0"}}
+EOF
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-en-repro repro --yes
+  [[ "$output" == *"no hace falta reiniciar dsh"* ]]
+  [[ "$output" != *"reiniciando dsh"* ]]
 }
 ```
 
@@ -764,44 +900,9 @@ Expected: FAIL — `plugins-remove` no está en el dispatcher.
 
 - [ ] **Step 3: Extraer `restart_dsh()` de `plugins_install()`**
 
-En `dsh-manage.sh`, dentro de `plugins_install()`, reemplazar el bloque:
+En `dsh-manage.sh`, dentro de `plugins_install()`, reemplazar el bloque final de restart+verificación por `restart_dsh || return 1`, y agregar la función `restart_dsh()` justo antes de `plugins_install() {`:
 
 ```bash
-  echo "reiniciando dsh para activar el stack..."
-  if dsh_service_manages_this_home; then
-    systemctl restart dsh.service
-    sleep 3
-  else
-    stop || true
-    sleep 1
-    start
-  fi
-
-  if ! wait_for_port; then
-    echo "dsh no quedó escuchando en :$DSH_PORT tras instalar los plugins, ver $DSH_LOG" >&2
-    return 1
-  fi
-
-  echo "boot OK, verificando errores conocidos en el log..."
-  if grep -qiE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG"; then
-    echo "⚠ se encontraron mensajes de error conocidos en $DSH_LOG — revisar antes de dar por bueno" >&2
-    grep -iE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG" | tail -20
-    return 1
-  fi
-```
-
-por:
-
-```bash
-  restart_dsh || return 1
-```
-
-Y agregar la función `restart_dsh()`, justo antes de `plugins_install() {`:
-
-```bash
-# Reinicia dsh y verifica que vuelva a levantar sano. Compartida por
-# plugins_install() y plugins_remove() -- antes vivia duplicada solo en
-# plugins_install(); un cambio hecho en una copia no se propagaba a la otra.
 restart_dsh() {
   echo "reiniciando dsh para activar los cambios..."
   if dsh_service_manages_this_home; then
@@ -832,10 +933,6 @@ restart_dsh() {
 Agregar justo después de `plugins_install()`:
 
 ```bash
-# Remueve un paquete de un profile con el gate de session-backup como
-# obligatorio en el medio. Es la direccion que causo el incidente original
-# (dsh-swarm-panel desinstalado sin aviso rompio sesiones reales) -- por eso
-# el backup automatico y la confirmacion NO son opcionales.
 plugins_remove() {
   local pkg="${1:-}" profile="${2:-web}"
   shift 2 2>/dev/null || true
@@ -874,14 +971,18 @@ plugins_remove() {
   local pkg_dir="$profile_dir/node_modules/$pkg"
   local guard_rc=0
   if [ -d "$pkg_dir" ]; then
-    session_backup_guard remove "$pkg_dir" "$profile"
-    guard_rc=$?
+    session_backup_guard remove "$pkg_dir" "$profile" || guard_rc=$?
+  fi
+
+  if [ "$guard_rc" -eq 1 ]; then
+    echo "el gate de resguardo fallo con un error duro; abortando plugins-remove sin remover nada" >&2
+    return 1
   fi
 
   if [ "$guard_rc" -eq 3 ]; then
     echo "creando backup automatico antes de continuar (trigger: plugins-remove)..."
     DSH_TRIGGER="plugins-remove" session_backup_create --only-at-risk \
-      --label "preremove-$(echo "$pkg" | tr -c 'A-Za-z0-9._-' '-')" || {
+      --label "preremove-$(printf '%s' "$pkg" | tr -c 'A-Za-z0-9._-' '-')" || {
       echo "fallo el backup automatico; abortando plugins-remove" >&2
       return 1
     }
@@ -903,8 +1004,6 @@ plugins_remove() {
       esac
     fi
   elif [ "$yes" -ne 1 ] && [ ! -t 0 ]; then
-    # Sin impacto detectado pero igual sin --yes y sin TTY: no removemos
-    # nada en modo no interactivo sin confirmacion explicita.
     echo "sin --yes y sin TTY: abortando sin remover nada" >&2
     return 1
   fi
@@ -913,11 +1012,20 @@ plugins_remove() {
   (cd "$profile_dir" && PATH="$DSH_NODE:$PATH" pnpm remove "$pkg") \
     || { echo "pnpm remove falló, ver arriba" >&2; return 1; }
 
-  restart_dsh || return 1
+  # dsh.service (generado por service_install) siempre sirve el profile
+  # "web" (PROFILE_DIR esta fijo en el unit) -- no hay un dsh.service por
+  # profile. Reiniciar produccion por tocar un profile que NO es el
+  # servido (ej. "repro") seria un impacto no consentido en un server
+  # compartido. Solo reiniciamos si el profile tocado es el productivo.
+  if [ "$profile" = "web" ]; then
+    restart_dsh || return 1
+  else
+    echo "profile '$profile' no es 'web' (el que sirve dsh.service) -- no hace falta reiniciar dsh"
+  fi
 
   echo "verificando el impacto real tras el restart..."
-  session_backup_scan --fail-on-risk >/dev/null 2>&1
-  local post_rc=$?
+  local post_rc=0
+  session_backup_scan --profile "$profile" --fail-on-risk >/dev/null 2>&1 || post_rc=$?
   if [ "$post_rc" -eq 4 ]; then
     echo "⚠ hay sesiones 'broken' tras remover '$pkg'. Backup disponible con 'dsh-manage session-backup list'." >&2
   fi
@@ -926,7 +1034,7 @@ plugins_remove() {
 }
 ```
 
-Agregar al dispatcher, justo después de `plugins-install)`:
+Agregar al dispatcher, después de `plugins-install)`:
 
 ```bash
   plugins-remove)   plugins_remove "${2:-}" "${3:-web}" "${@:4}" ;;
@@ -940,15 +1048,12 @@ Expected: PASS + shellcheck limpio.
 
 - [ ] **Step 6: Verificar contra el host real — SOLO en un profile descartable**
 
-**No correr esto contra el profile `web` de producción.** Usar el profile `repro` (ya existe, ya se usó para el gate de `repair`):
-
 ```bash
 cd /opt/dsh-manage
 ./dsh-manage.sh plugins-remove dsh-defend repro --yes 2>&1 | tail -20
-# revertir para dejar repro como estaba:
 (cd "$HOME/.dsh/profiles/repro" && PATH="$HOME/.local/dsh-node/node24/bin:$PATH" pnpm install)
 ```
-Expected: el `guard` corre, si `dsh-defend` no declara vocabulario de sesión el `guard_rc` es 0 y remueve directo; `pnpm remove` sale limpio; `restart_dsh` no aplica si `repro` no es el profile activo del `dsh.service` (confirmar con `dsh_service_manages_this_home` antes — si `repro` no es el `WorkingDirectory` del unit, este restart no toca producción).
+Expected: `pnpm remove` sale limpio; el restart no debe afectar el `dsh.service` real si `repro` no es su `WorkingDirectory`.
 
 - [ ] **Step 7: Commit**
 
@@ -959,7 +1064,7 @@ git commit -m "feat(session-backup): plugins_remove con gate de resguardo obliga
 
 ---
 
-### Task 5: Hook de `session_backup_guard` en `plugins_install()`
+### Task 5: Gate completo de `session_backup_guard` en `plugins_install()` (pre-install + post-check)
 
 **Files:**
 - Modify: `dsh-manage.sh`
@@ -967,39 +1072,85 @@ git commit -m "feat(session-backup): plugins_remove con gate de resguardo obliga
 
 **Interfaces:**
 - Consumes: `session_backup_guard()` (Task 3).
-- Produces: modificación de `plugins_install()` existente (sin cambiar su firma).
+- Produces: modificación de `plugins_install()` existente.
 
 - [ ] **Step 1: Escribir el test que falla**
 
 Agregar a `tests/session-backup.bats`:
 
 ```bash
-@test "plugins_install corre scan post-install y avisa si aparecen broken" {
-  # Test de humo: confirma que la funcion sigue siendo invocable y no rompe
-  # el flujo existente cuando no hay manifest (fast-fail esperado, ya
-  # cubierto por tests/dsh-manage.bats -- aca solo confirmamos que el nuevo
-  # bloque de post-check no introduce un error de sintaxis bash.
+@test "plugins_install crea backup pre-install cuando un paquete del manifest es event-writer con sesiones afectadas" {
   install_fake_harness 48
-  run bash -n "$BATS_TEST_DIRNAME/../dsh-manage.sh"
+  mkdir -p "$DSH_HOME/profiles/web"
+  fake_session "$DSH_HOME/sessions" "--ws-pi1--" "session-pi1" "session-pi1" \
+    '{"type":"preinstall/evento","seq":1,"time":1,"data":{}}'
+  nm_fake="$BATS_TEST_TMPDIR/tarball-plugin/lib"
+  mkdir -p "$nm_fake"
+  cat > "$BATS_TEST_TMPDIR/tarball-plugin/package.json" <<'EOF'
+{"name":"plugin-preinstall-test","version":"1.0.0"}
+EOF
+  cat > "$nm_fake/index.js" <<'EOF'
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+export function emit(s) { s.append("preinstall/evento", {}); }
+EOF
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard install "$BATS_TEST_TMPDIR/tarball-plugin" web
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"session-pi1"* ]] || [[ "$output" == *"1"* ]]
+}
+
+@test "plugins_install post-check usa --profile correctamente (no posicional)" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/sessions"
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_scan --profile web --fail-on-risk
   [ "$status" -eq 0 ]
+  [[ "$output" != *"opcion desconocida"* ]]
 }
 ```
 
-(El comportamiento funcional completo de `plugins_install()` con el manifest real ya está cubierto por `tests/dsh-manage.bats`; este test es deliberadamente mínimo — confirma sintaxis, no reimplementa esos tests.)
+- [ ] **Step 2: Correr los tests**
 
-- [ ] **Step 2: Correr el test para ver que pasa incluso antes del cambio**
+Run: `cd /opt/dsh-manage && bats tests/session-backup.bats -f "plugins_install"`
+Expected: ambos pasan ya (dependen de Task 3, sirven de referencia para el Step 3).
 
-Run: `cd /opt/dsh-manage && bats tests/session-backup.bats -f "plugins_install corre scan"`
-Expected: PASS (test de sintaxis, no depende del cambio todavía — se agrega ahora para que la Task 6 self-review pueda confirmarlo después del cambio también).
+- [ ] **Step 3: Agregar el gate pre-install y corregir el post-check en `plugins_install()`**
 
-- [ ] **Step 3: Agregar el post-check a `plugins_install()`**
+Dentro de `plugins_install()`, **antes** del bloque `echo "corriendo pnpm install..."`, agregar:
 
-Dentro de `plugins_install()`, inmediatamente después del bloque que ahora es `restart_dsh || return 1` (de la Task 4), agregar:
+```bash
+  echo "revisando si el stack a instalar afecta sesiones existentes..."
+  local manifest_pkgs
+  manifest_pkgs="$(node -e "
+    const m = require('$DSH_MANIFEST');
+    console.log(Object.keys(m.dependencies || {}).join('\n'));
+  " 2>/dev/null)"
+  local pkg any_impact=0
+  for pkg in $manifest_pkgs; do
+    local installed_dir="$profile_dir/node_modules/$pkg"
+    [ -d "$installed_dir" ] || continue
+    local guard_rc=0
+    session_backup_guard install "$installed_dir" "$profile" || guard_rc=$?
+    if [ "$guard_rc" -eq 3 ]; then
+      any_impact=1
+    fi
+  done
+  if [ "$any_impact" -eq 1 ]; then
+    echo "creando backup automatico antes de instalar (trigger: plugins-install)..."
+    DSH_TRIGGER="plugins-install" session_backup_create --only-at-risk \
+      --label "preinstall-$(date -u +%Y%m%dT%H%M%SZ)" || {
+      echo "fallo el backup automatico; abortando plugins-install" >&2
+      return 1
+    }
+  fi
+```
+
+Y reemplazar el bloque final ya existente (después de `restart_dsh || return 1`):
 
 ```bash
   echo "revisando el impacto del stack instalado sobre las sesiones existentes..."
   local scan_rc=0
-  session_backup_scan "$profile" --fail-on-risk >/dev/null 2>&1 || scan_rc=$?
+  session_backup_scan --profile "$profile" --fail-on-risk >/dev/null 2>&1 || scan_rc=$?
   if [ "$scan_rc" -eq 4 ]; then
     echo "⚠ hay sesiones 'broken' tras instalar el stack. Corré 'dsh-manage session-backup scan' para el detalle." >&2
   elif [ "$scan_rc" -eq 3 ]; then
@@ -1010,13 +1161,13 @@ Dentro de `plugins_install()`, inmediatamente después del bloque que ahora es `
 - [ ] **Step 4: Correr los tests**
 
 Run: `cd /opt/dsh-manage && bats tests/ && make check`
-Expected: PASS — incluidos los tests de `tests/dsh-manage.bats` que ya cubrían `plugins_install`.
+Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add dsh-manage.sh tests/session-backup.bats
-git commit -m "feat(session-backup): post-check de riesgo tras plugins-install"
+git commit -m "feat(session-backup): gate pre-install completo + post-check corregido en plugins-install"
 ```
 
 ---
@@ -1030,16 +1181,14 @@ git commit -m "feat(session-backup): post-check de riesgo tras plugins-install"
 
 **Interfaces:**
 - Consumes: `require_dsh_stopped()`, `session_backup_create()`, `invalidate_projcache_entry()` (Task 1); `load_baseline()`, `CHUNK_ROW_TAGS` (Fase 1+2).
-- Produces: `repair_events()` (Python, pura), CLI `session-scan.py repair --artifact <ruta> --harness <ruta> --out <ruta> [--types <a,b>]`, `session_backup_repair()` (bash).
-
-> Gate ya superado (spec §7.3): esta tarea implementa lo que ya se validó manualmente contra la sesión real de `vpn-monitor-mke`.
+- Produces: `repair_events()` (header excluido, **aborta si el artefacto está torn**), `find_session` (sin `grep` sobre `.zstd`), `session_backup_repair()` (**temporales fuera de `sessions/`**).
 
 - [ ] **Step 1: Escribir los tests que fallan**
 
 Agregar a `tests/session-backup.bats`:
 
 ```bash
-@test "repair marca solo los tipos desconocidos, copia el resto byte a byte" {
+@test "repair marca solo tipos desconocidos, preserva byte a byte lo demas Y el header" {
   install_fake_harness 48
   h="$(install_fake_harness 48)"
   fake_session "$DSH_HOME/sessions" "--ws-rp1--" "session-rp1" "session-rp1" \
@@ -1049,13 +1198,33 @@ Agregar a `tests/session-backup.bats`:
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-repair-rp1
   run env DSH_PORT=39222 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp1 --mark-ignorable --yes
   [ "$status" -eq 0 ]
-  # el evento marcado debe tener ignorable:true; los otros deben seguir igual
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '1p'"
+  [[ "$output" != *"ignorable"* ]]
+  [[ "$output" == *'"type":"session"'* ]]
   run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '3p'"
-  [[ "$output" == *'"ignorable": true'* ]] || [[ "$output" == *'"ignorable":true'* ]]
-  # la primera linea de datos (tipo/1) debe seguir teniendo el espacio raro
-  # original (prueba de que no se re-serializo)
+  [[ "$output" == *'"ignorable": true'* ]]
   run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '2p'"
   [[ "$output" == *'"x":  1'* ]]
+}
+
+@test "repair aborta sobre un artefacto con cola rota, no publica un archivo parcial" {
+  install_fake_harness 48
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-rp5--" "session-rp5" "session-rp5" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}' \
+    '{"type":"foo/desconocido","seq":2,"time":2,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp5
+  # truncar el .zstd a la mitad para simular una escritura interrumpida
+  artifact="$DSH_HOME/sessions/--ws-rp5--/session-rp5/session.jsonl.zstd"
+  size="$(stat -c%s "$artifact")"
+  head -c $((size / 2)) "$artifact" > "${artifact}.tmp"
+  mv "${artifact}.tmp" "$artifact"
+  original_content="$(cat "$artifact" | xxd | head -1)"
+  run env DSH_PORT=39228 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp5 --mark-ignorable --yes
+  [ "$status" -ne 0 ]
+  # el artefacto truncado no se toco (no se publico un "reparado" parcial)
+  current_content="$(cat "$artifact" | xxd | head -1)"
+  [ "$original_content" = "$current_content" ]
 }
 
 @test "repair exige DSH detenido" {
@@ -1064,18 +1233,17 @@ Agregar a `tests/session-backup.bats`:
     '{"type":"foo/x","seq":1,"time":1,"data":{}}'
   bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp2
   python3 -c "
-import socket, os
+import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.bind(('127.0.0.1', 39223))
 s.listen(1)
-if os.fork() == 0:
-    s.accept()
-else:
-    import time; time.sleep(0.3)
+time.sleep(2)
 " &
-  sleep 0.2
+  listener_pid=$!
+  sleep 0.3
   run env DSH_PORT=39223 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp2 --mark-ignorable --yes
-  kill %1 2>/dev/null || true
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
   [ "$status" -ne 0 ]
 }
 
@@ -1086,7 +1254,19 @@ else:
   [[ "$output" == *"--session"* ]]
 }
 
-@test "repair hace backup implicito antes de tocar la sesion" {
+@test "repair encuentra la sesion por id de header aunque el directorio no coincida" {
+  install_fake_harness 48
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-rp4--" "67890" "session-67890" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp4
+  run env DSH_PORT=39226 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-67890 --mark-ignorable --yes
+  [ "$status" -eq 0 ]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp4--/67890/session.jsonl.zstd' | sed -n '2p'"
+  [[ "$output" == *'"ignorable": true'* ]]
+}
+
+@test "repair hace backup implicito antes de tocar la sesion y no deja temporales bajo sessions/" {
   install_fake_harness 48
   fake_session "$DSH_HOME/sessions" "--ws-rp3--" "session-rp3" "session-rp3" \
     '{"type":"foo/x","seq":1,"time":1,"data":{}}'
@@ -1096,6 +1276,9 @@ else:
   [ "$status" -eq 0 ]
   after_count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' | wc -l)"
   [ "$after_count" -gt "$before_count" ]
+  # sin restos .repair-plain / .repair-tmp bajo sessions/
+  leftovers="$(find "$DSH_HOME/sessions" -name '*.repair-*' 2>/dev/null | wc -l)"
+  [ "$leftovers" -eq 0 ]
 }
 ```
 
@@ -1104,29 +1287,40 @@ else:
 Run: `cd /opt/dsh-manage && bats tests/session-backup.bats`
 Expected: FAIL — `repair` no es un subcomando válido.
 
-- [ ] **Step 3: Agregar `repair_events` al helper Python**
+- [ ] **Step 3: Agregar `repair_events` (con chequeo de cola rota) y `find_session` al helper Python**
 
 Agregar a `plugins/session-scan.py`, antes de `main()`:
 
 ```python
 def repair_events(artifact, baseline, allowed_types=None):
-    """Marca ignorable:true SOLO en lineas cuyo tipo esta fuera del baseline
-    (y opcionalmente restringido a allowed_types). Copia byte a byte todo lo
-    demas -- NUNCA re-serializa una linea que no se marca (round-trip de
-    json.dumps cambia whitespace/orden aunque el contenido sea igual, lo que
-    violaria "copiar byte a byte lo no tocado").
+    """Marca ignorable:true SOLO en lineas fuera del baseline. El HEADER
+    (primera linea, type=session) NUNCA se toca.
 
-    Devuelve (lineas_de_salida, cantidad_marcada). No escribe ningun archivo:
-    el llamador decide donde y como persistir (temp + mv atomico).
+    Aborta (SystemExit) si el artefacto esta TORN (zstd -dc con
+    returncode != 0): read_session_events() (uso de solo lectura, scan) SI
+    tolera una cola rota porque el harness la descarta al cargar -- pero
+    repair REESCRIBE el artefacto, y publicar solo el fragmento recuperado
+    como si fuera el log completo seria perder la cola para siempre sin
+    aviso. Verificado: un artefacto truncado al 70% da returncode=1 y datos
+    parciales que parecen "normales" si no se chequea el codigo de salida.
     """
     if artifact.endswith(".zstd"):
-        raw = subprocess.run(["zstd", "-dc", artifact], capture_output=True).stdout.decode("utf-8", errors="replace")
+        proc = subprocess.run(["zstd", "-dc", artifact], capture_output=True)
+        if proc.returncode != 0:
+            raise SystemExit(
+                f"el artefacto {artifact} tiene una cola rota (zstd -dc "
+                f"rc={proc.returncode}). repair no puede reescribir un log "
+                f"truncado sin arriesgar perder la cola -- usar restore "
+                f"desde un snapshot previo en su lugar."
+            )
+        raw = proc.stdout.decode("utf-8", errors="replace")
     else:
         with open(artifact, encoding="utf-8", errors="replace") as f:
             raw = f.read()
     lines = raw.splitlines()
     out = []
     marked = 0
+    header_seen = False
     for line in lines:
         if not line.strip():
             out.append(line)
@@ -1134,16 +1328,20 @@ def repair_events(artifact, baseline, allowed_types=None):
         try:
             row = json.loads(line)
         except ValueError:
-            out.append(line)  # cola rota: se copia tal cual, no se toca
+            out.append(line)
             continue
         kind = row.get("type")
+        if not header_seen and kind == "session":
+            header_seen = True
+            out.append(line)
+            continue
         is_chunk_row = kind in CHUNK_ROW_TAGS
         already_ok = kind in baseline or row.get("ignorable") is True or is_chunk_row
         if already_ok:
-            out.append(line)  # BYTE A BYTE, sin re-serializar
+            out.append(line)
             continue
         if allowed_types is not None and kind not in allowed_types:
-            out.append(line)  # fuera del filtro --types: no se toca
+            out.append(line)
             continue
         row["ignorable"] = True
         out.append(json.dumps(row, ensure_ascii=False))
@@ -1158,6 +1356,42 @@ def cmd_repair(args):
     with open(args.out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     print(f"{marked} eventos marcados ignorable:true")
+
+
+def cmd_find_session(args):
+    """Resuelve una sesion por directorio O por id-de-header, descomprimiendo
+    (nunca grep sobre binarios .zstd, que no puede leerlos)."""
+    sessions_dir = args.sessions
+    ref = args.ref
+    for ws in sorted(os.listdir(sessions_dir)):
+        wsd = os.path.join(sessions_dir, ws)
+        if not os.path.isdir(wsd):
+            continue
+        for d in sorted(os.listdir(wsd)):
+            dpath = os.path.join(wsd, d)
+            if not os.path.isdir(dpath):
+                continue
+            if d == ref:
+                print(dpath)
+                return
+            for name in ("session.jsonl.zstd", "session.jsonl"):
+                art = os.path.join(dpath, name)
+                if not os.path.isfile(art):
+                    continue
+                if art.endswith(".zstd"):
+                    raw = subprocess.run(["zstd", "-dc", art], capture_output=True).stdout.decode("utf-8", errors="replace")
+                else:
+                    with open(art, encoding="utf-8", errors="replace") as f:
+                        raw = f.read()
+                first_line = raw.splitlines()[0] if raw else ""
+                try:
+                    header = json.loads(first_line)
+                except ValueError:
+                    continue
+                if header.get("id") == ref:
+                    print(dpath)
+                    return
+    raise SystemExit(1)
 ```
 
 y su registro en `main()`:
@@ -1166,19 +1400,21 @@ y su registro en `main()`:
     p = sub.add_parser("repair", help="marca eventos huerfanos como ignorable (uso interno)")
     p.add_argument("--artifact", required=True)
     p.add_argument("--harness", required=True)
-    p.add_argument("--out", required=True, help="ruta del jsonl plano de salida")
-    p.add_argument("--types", default=None, help="lista separada por comas; restringe a estos tipos")
+    p.add_argument("--out", required=True)
+    p.add_argument("--types", default=None)
     p.set_defaults(func=cmd_repair)
+
+    p = sub.add_parser("find-session", help="resuelve una sesion por dir o id (uso interno)")
+    p.add_argument("--sessions", required=True)
+    p.add_argument("--ref", required=True)
+    p.set_defaults(func=cmd_find_session)
 ```
 
-- [ ] **Step 4: Escribir `session_backup_repair()` en bash**
+- [ ] **Step 4: Escribir `session_backup_repair()` en bash (temporales fuera de `sessions/`)**
 
 Agregar a `dsh-manage.sh`, después de `plugins_remove()`:
 
 ```bash
-# repair: marca eventos huerfanos como ignorable:true, in-place, para que la
-# sesion cargue sin el plugin que los escribio. Lossy (esos eventos dejan de
-# interpretarse) y se dice sin eufemismos en la salida. Nunca en lote.
 session_backup_repair() {
   local session="" mark_ignorable=0 types="" yes=0
   while [ $# -gt 0 ]; do
@@ -1212,31 +1448,34 @@ session_backup_repair() {
   require_dsh_stopped || return 1
 
   local sessions_dir="$DSH_HOME/sessions"
-  local artifact
-  artifact="$(find "$sessions_dir" -type d -name "$session" -print -quit 2>/dev/null)"
-  if [ -z "$artifact" ]; then
-    # tambien aceptar buscar por el id del header, no solo el nombre de dir
-    artifact="$(grep -rl "\"id\":\"$session\"" "$sessions_dir" 2>/dev/null | head -1)"
-    [ -n "$artifact" ] && artifact="$(dirname "$artifact")"
-  fi
-  if [ -z "$artifact" ]; then
+  local artifact_dir
+  artifact_dir="$(python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" find-session --sessions "$sessions_dir" --ref "$session")" || {
     echo "no se encontro la sesion '$session' bajo $sessions_dir" >&2
     return 1
-  fi
-  local artifact_file
+  }
+  local artifact_file=""
   for f in "session.jsonl.zstd" "session.jsonl"; do
-    [ -f "$artifact/$f" ] && artifact_file="$artifact/$f"
+    [ -f "$artifact_dir/$f" ] && artifact_file="$artifact_dir/$f"
   done
-  [ -n "${artifact_file:-}" ] || { echo "sin artefacto de sesion en $artifact" >&2; return 1; }
+  [ -n "$artifact_file" ] || { echo "sin artefacto de sesion en $artifact_dir" >&2; return 1; }
 
   echo "creando backup antes de reparar..."
-  session_backup_create --label "pre-repair-$(basename "$session")-$(date -u +%Y%m%dT%H%M%SZ)" || {
-    echo "fallo el backup previo; abortando repair sin tocar nada" >&2
+  local backup_rc=0
+  session_backup_create --label "pre-repair-$(basename "$session")-$(date -u +%Y%m%dT%H%M%SZ)" || backup_rc=$?
+  if [ "$backup_rc" -ne 0 ] && [ "$backup_rc" -ne 2 ]; then
+    echo "fallo el backup previo (rc=$backup_rc); abortando repair sin tocar nada" >&2
     return 1
-  }
+  fi
 
   umask 077
-  local out_plain="${artifact_file}.repair-plain"
+  # Los temporales viven en un scratch bajo DSH_BACKUP_ROOT, NUNCA bajo
+  # sessions/ (invariante S5.1). Mismo filesystem que sessions/ (confirmado
+  # mismo device id), asi que el mv -T final sigue siendo atomico.
+  local scratch="$DSH_BACKUP_ROOT/.repair-scratch"
+  mkdir -p "$scratch"
+  local work_id
+  work_id="$(basename "$artifact_file")-$$-$(date -u +%s)"
+  local out_plain="$scratch/${work_id}.plain"
   local repair_args=(
     "$DSH_MANAGE_DIR/plugins/session-scan.py" repair
     --artifact "$artifact_file"
@@ -1248,21 +1487,38 @@ session_backup_repair() {
   repair_output="$(python3 "${repair_args[@]}")" || { rm -f "$out_plain"; return 1; }
   echo "$repair_output"
 
-  local new_zstd="${artifact_file}.repair-tmp"
+  local new_artifact="$scratch/${work_id}.repaired"
   if [[ "$artifact_file" == *.zstd ]]; then
-    zstd -q -f -o "$new_zstd" "$out_plain"
+    zstd -q -f -o "$new_artifact" "$out_plain" || { rm -f "$out_plain" "$new_artifact"; return 1; }
   else
-    cp "$out_plain" "$new_zstd"
+    cp "$out_plain" "$new_artifact"
   fi
   rm -f "$out_plain"
 
-  # Validacion final antes de publicar in-place.
-  if [[ "$new_zstd" == *.zstd ]]; then
-    zstd -t "$new_zstd" >/dev/null 2>&1 || { echo "el archivo reparado no valida (zstd -t), abortando" >&2; rm -f "$new_zstd"; return 1; }
+  local orig_lines new_lines orig_header new_header
+  if [[ "$artifact_file" == *.zstd ]]; then
+    zstd -t "$new_artifact" >/dev/null 2>&1 || { echo "el archivo reparado no valida (zstd -t), abortando" >&2; rm -f "$new_artifact"; return 1; }
+    orig_lines="$(zstd -dc "$artifact_file" | wc -l)"
+    new_lines="$(zstd -dc "$new_artifact" | wc -l)"
+    orig_header="$(zstd -dc "$artifact_file" | head -1)"
+    new_header="$(zstd -dc "$new_artifact" | head -1)"
+  else
+    orig_lines="$(wc -l < "$artifact_file")"
+    new_lines="$(wc -l < "$new_artifact")"
+    orig_header="$(head -1 "$artifact_file")"
+    new_header="$(head -1 "$new_artifact")"
+  fi
+  if [ "$orig_lines" != "$new_lines" ] || [ "$orig_header" != "$new_header" ]; then
+    echo "el archivo reparado no preserva lineas/header original, abortando" >&2
+    rm -f "$new_artifact"
+    return 1
   fi
 
-  mv -T "$new_zstd" "$artifact_file"
-  invalidate_projcache_entry "$(basename "$artifact")" || true
+  require_dsh_stopped || { echo "dsh arranco durante el repair; abortando antes de publicar" >&2; rm -f "$new_artifact"; return 1; }
+
+  mv -T "$new_artifact" "$artifact_file"
+  invalidate_projcache_entry "$session" || true
+  rmdir "$scratch" 2>/dev/null || true
 
   echo "repair completo sobre $artifact_file"
 }
@@ -1280,7 +1536,7 @@ y su línea de uso a `{scan|create|list|verify|restore|prune|repair}`.
 Run: `cd /opt/dsh-manage && bats tests/session-backup.bats && make check`
 Expected: PASS + shellcheck limpio.
 
-- [ ] **Step 6: Re-confirmar el gate contra la sesión real** (ya hecho manualmente en §7.3, repetirlo ahora vía el comando real)
+- [ ] **Step 6: Re-confirmar el gate contra la sesión real**
 
 ```bash
 cd /opt/dsh-manage
@@ -1288,14 +1544,31 @@ cd /opt/dsh-manage
 systemctl stop dsh.service
 ./dsh-manage.sh session-backup repair --session session-67436620-4931-423a-aeac-3b7eb7b03ec9 --mark-ignorable --yes
 systemctl start dsh.service
+node -e "
+const sessionLib = require('$HOME/.local/dsh-node/node24/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-session/lib/index.js');
+const raw = require('child_process').execSync('zstd -dc \"$HOME/.dsh/sessions/--opt-vpn-monitor-mke--/session-67436620-4931-423a-aeac-3b7eb7b03ec9/session.jsonl.zstd\"', {maxBuffer: 1024*1024*50}).toString('utf-8');
+const lines = raw.split('\n').filter(Boolean);
+const KNOWN = sessionLib.KNOWN_SESSION_EVENT_TYPES;
+let rejected = 0;
+for (const line of lines) {
+  const row = JSON.parse(line);
+  if (row.type === 'session') continue;
+  const events = sessionLib.decodeStorageRecord(row);
+  for (const ev of events) {
+    if (!KNOWN.has(ev.type) && ev.ignorable !== true) rejected++;
+  }
+}
+console.log('rejected:', rejected, '(esperado: 0)');
+"
+find "$HOME/.dsh/sessions" -name '*.repair-*' -o -name '*repair-plain*' -o -name '*repair-tmp*'
 ```
-Expected: `N eventos marcados ignorable:true` con N cercano a 80 (el número exacto puede variar levemente si el corpus cambió). Verificar después que la sesión sigue siendo legible por el harness (mismo chequeo del gate §7.3: `decodeStorageRecord` + `KNOWN_SESSION_EVENT_TYPES` da 0 rechazados).
+Expected: `N eventos marcados ignorable:true`, `rejected: 0`, y el `find` final **sin salida** (ningún resto bajo `sessions/`).
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add plugins/session-scan.py dsh-manage.sh tests/session-backup.bats
-git commit -m "feat(session-backup): subcomando repair --mark-ignorable"
+git commit -m "feat(session-backup): subcomando repair --mark-ignorable, header excluido, aborta ante cola rota"
 ```
 
 ---
@@ -1303,20 +1576,21 @@ git commit -m "feat(session-backup): subcomando repair --mark-ignorable"
 ### Task 7: Versión y documentación
 
 **Files:**
-- Modify: `dsh-manage.sh` (línea de versión), `CHANGELOG.md`, `README.md`
+- Modify: `dsh-manage.sh`, `CHANGELOG.md`, `README.md`, `tests/session-backup.bats`
 - Test: `tests/session-backup.bats`
 
-- [ ] **Step 1: Bump de versión**
+- [ ] **Step 1: Bump de versión y arreglo del test heredado**
 
-En `dsh-manage.sh`, buscar la línea exacta con `grep -n 'DSH_MANAGE_VERSION='` (hoy dice `"1.2.0"`) y cambiarla a:
+Cambiar `DSH_MANAGE_VERSION="1.2.0"` a `"1.3.0"` en `dsh-manage.sh`. **En el mismo commit**, actualizar el test que afirma `'1.2.0'` en `tests/session-backup.bats` a `'1.3.0'`.
 
-```bash
-DSH_MANAGE_VERSION="1.3.0"
-```
+- [ ] **Step 2: Correr los tests**
 
-- [ ] **Step 2: CHANGELOG**
+Run: `cd /opt/dsh-manage && bats tests/`
+Expected: PASS.
 
-Insertar inmediatamente antes de la línea `## [1.2.0] - 2026-08-25` (buscar con `grep -n '^## \[1.2.0\]'`):
+- [ ] **Step 3: CHANGELOG**
+
+Insertar antes de `## [1.2.0] - 2026-08-25`:
 
 ```markdown
 ## [Unreleased]
@@ -1324,76 +1598,47 @@ Insertar inmediatamente antes de la línea `## [1.2.0] - 2026-08-25` (buscar con
 ### Agregado
 
 - `dsh-manage session-backup restore` — restaura sesiones desde un snapshot,
-  con backup implícito previo, exige DSH detenido, escritura atómica.
-  `--session` limita a una sola sesión, `--to-new-id` restaura como sesión
-  nueva sin pisar la original, `--force` sobreescribe aunque difiera.
-- `dsh-manage session-backup prune` — borra snapshots viejos por retención
-  (`--keep` / `--older-than`), nunca borra el único backup que cubre una
-  sesión `broken`. Requiere `--yes` explícito.
+  con backup implícito previo (tolera "nada que respaldar"), exige DSH
+  detenido (verificado dos veces), escritura atómica. `--session` limita a
+  una sola sesión, `--to-new-id` restaura como sesión nueva reescribiendo el
+  `id` del header, `--force` es obligatorio para pisar un destino que difiere.
+  El nombre de snapshot pasado a `--from` (incluido `latest`) se resuelve a
+  una ruta absoluta antes de cualquier operación que pueda cambiar a qué
+  apunta `latest`.
+- `dsh-manage session-backup prune` — borra snapshots viejos (`--keep` /
+  `--older-than`), con protección **por sesión individual**: nunca borra la
+  única copia de una sesión `broken`, incluso cuando varios candidatos a
+  borrar comparten esa sesión entre sí.
 - `dsh-manage session-backup repair --mark-ignorable` — marca eventos
-  huérfanos como `ignorable:true` in-place para que una sesión cargue sin el
-  plugin que los escribió. Lossy (esos eventos dejan de interpretarse),
-  nunca en lote (`--session` obligatorio), copia byte a byte todo lo que no
-  marca. Gate de validación superado contra la sesión real de
-  `vpn-monitor-mke` antes de implementar (ver `docs/SESSION-BACKUP-DESIGN.md`
-  §7.3).
-- `dsh-manage plugins-remove <paquete> [profile] [--yes]` — nuevo comando que
-  cierra la causa raíz del incidente original: antes de un `pnpm remove`,
-  corre el gate de resguardo (`session_backup_guard`), hace backup automático
-  si detecta impacto, y exige confirmación explícita (aborta sin `--yes` y
-  sin TTY). Reinicia `dsh.service` con la misma verificación post-restart que
-  `plugins-install` ya usa.
-- `plugins-install` corre un chequeo de riesgo post-instalación y avisa si
-  aparecen sesiones `at-risk`/`broken` tras el stack instalado.
-- Invalidación de `session_projcache.json` en `restore`/`repair`: se borra
-  solo la clave de la sesión tocada, las demás se preservan (spec §7.2).
+  huérfanos como `ignorable:true` in-place, sin tocar nunca el header.
+  Aborta sin publicar nada si el artefacto de origen tiene una cola rota
+  (evita reescribir un log truncado y perder la cola para siempre). Lossy,
+  nunca en lote, copia byte a byte todo lo que no marca, y no deja
+  temporales bajo `sessions/`. Gate de validación superado contra la sesión
+  real de `vpn-monitor-mke`.
+- `dsh-manage plugins-remove <paquete> [profile] [--yes]` — gate de
+  resguardo (`session_backup_guard`, solo lectura) antes de `pnpm remove`,
+  backup automático si detecta impacto, confirmación explícita obligatoria.
+- `plugins-install` corre el gate de resguardo **antes** de instalar.
 
-### Cambiado
+### Corregido
 
 - `restart_dsh()` extraída de `plugins_install()` para compartirla con
-  `plugins_remove()` — antes vivía duplicada solo en un lugar.
+  `plugins_remove()`.
+- Los 2 warnings `SC2181` preexistentes en `tests/session-backup.bats`
+  quedan saneados — `make check` vuelve a pasar limpio de punta a punta.
 ```
 
-- [ ] **Step 3: README**
+- [ ] **Step 4: README**
 
-Ampliar la tabla de comandos (buscar la fila de `session-backup` ya existente y reemplazarla):
+Ampliar la tabla de comandos y la sección `### session-backup: resguardo de sesiones` con los nuevos subcomandos, siguiendo el mismo estilo ya existente en el archivo.
 
-```markdown
-| `session-backup {scan,create,list,verify,restore,prune,repair}` | Resguardo de sesiones: clasifica riesgo, crea/restaura/repara snapshots |
-| `plugins-remove <paquete> [profile] [--yes]` | Remueve un plugin con gate de resguardo automático |
-```
-
-Ampliar la sección `### session-backup: resguardo de sesiones` (buscar con `grep -n '^### .session-backup'`), agregando después de la tabla `ok`/`at-risk`/`broken` existente:
-
-````markdown
-```bash
-dsh-manage session-backup restore --from latest --session <id>   # recuperar una sesion
-dsh-manage session-backup repair --session <id> --mark-ignorable --yes  # sin reinstalar el plugin
-dsh-manage session-backup prune --keep 10 --yes                  # limpiar snapshots viejos
-```
-
-`restore` y `repair` son las únicas dos operaciones de todo `session-backup`
-que escriben bajo `sessions/`. Ambas exigen `dsh.service` detenido (el writer
-mantiene un descriptor en modo append; escribir por debajo pierde la
-restauración en silencio) y hacen un backup del estado actual antes de tocar
-nada — el rollback siempre está disponible con otro `restore`.
-
-`repair --mark-ignorable` es **lossy**: los eventos marcados dejan de
-interpretarse (la sesión carga, pero lo que ese plugin mostraba no aparece).
-Es la alternativa a reinstalar el plugin, no un reemplazo de tenerlo.
-
-`plugins-remove` reemplaza a un `pnpm remove` manual cuando el paquete puede
-tener eventos de sesión: corre el gate, hace backup si hace falta, y pide
-confirmación antes de tocar nada. Para paquetes sin ese riesgo, sigue
-funcionando `dsh plugin --profile <p> remove <paquete>` directo.
-````
-
-- [ ] **Step 4: Verificación final completa**
+- [ ] **Step 5: Verificación final completa**
 
 Run: `cd /opt/dsh-manage && make check && make bats`
 Expected: shellcheck limpio, todos los tests verdes.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add dsh-manage.sh CHANGELOG.md README.md tests/session-backup.bats
@@ -1404,26 +1649,34 @@ git commit -m "docs(session-backup): documentar restore/prune/repair/plugins-rem
 
 ## Self-Review
 
-**1. Cobertura del spec (Fases 3, 4, 5 + enmiendas §7.2, §7.3)**
+**1. Cobertura de los 17 bloqueantes del arbitraje formal + 5 hallazgos detectados durante la escritura final (D1, R1, R5, P4, P5)**
 
-| Sección del spec | Dónde se resuelve |
-|---|---|
-| §1 `restore` (flags `--from/--session/--force/--to-new-id`) | Task 1 |
-| §1 `prune` (flags `--keep/--older-than/--yes`) | Task 2 |
-| §1 `repair` (flags `--session/--mark-ignorable/--types/--yes`) | Task 6 |
-| §4.2 gate compartido | Task 3 |
-| §4.3 `plugins-remove` (backup automático, confirmación, restart) | Task 4 |
-| §4.4 `plugins-install` post-check | Task 5 |
-| §5.1 regla 4 (backup implícito) | Tasks 1 y 6 |
-| §5.1 regla 5 (DSH detenido, sin override) | Tasks 1 y 6, `require_dsh_stopped()` |
-| §5.5 reglas de `repair` (copiar byte a byte, `seq`/`time` intactos) | Task 6, `repair_events()` |
-| §7.2 invalidación de `session_projcache.json` | Task 1, `invalidate_projcache_entry()`, usada también en Task 6 |
-| §7.3 gate de `repair` superado | Ya ejecutado antes de este plan; Task 6 lo reproduce como parte del flujo real |
-| §7.4 decisiones de alcance (plan único, restart mitigado, ronda de crítica) | Este plan entero |
-| §5.6 códigos de salida (2, 3, 4, 5) | `session_backup_guard` usa 0/2/3; `plugins_remove` usa el rc del guard |
+| # | Bloqueante | Dónde se resuelve |
+|---|---|---|
+| D1 | `--from latest` resuelto con `readlink -f` antes del backup implícito | Task 1 |
+| R1 | `repair` aborta ante artefacto torn, no publica un log parcial | Task 6 |
+| R5 | Temporales de `repair` fuera de `sessions/` (scratch en `DSH_BACKUP_ROOT`) | Task 6 |
+| P4 | `restart_dsh` solo corre si el profile tocado es `web` (el único servido por `dsh.service`) | Task 4 |
+| P5 | `printf '%s'` en vez de `echo` para el label automático (evita guión colgante) | Task 4 |
+| A1 | `prune` protección por-sesión | Task 2 |
+| V7/A5 | `guard_rc=$?`/`post_rc=$?` bajo `set -e` (2 sitios) | Task 4 |
+| A2 | `restore`/`repair` aceptan rc=0/2 del backup implícito | Tasks 1 y 6 |
+| V11 | `--to-new-id` reescribe el `id` del header | Task 1 |
+| V1 | `session_backup_scan --profile`, nunca posicional | Tasks 4 y 5 |
+| V8 | Header excluido de `repair_events` | Task 6 |
+| V6/R2 | Búsqueda de sesión sin `grep` sobre `.zstd` | Task 6 |
+| A3 + V9 | `SC2181` heredados + `mapfile` | Task 2 |
+| #2/M-1 | `--force` obligatorio | Task 1 |
+| #5 | Contrato `session_backup_guard` 0/1/3 | Task 3 |
+| #7 | Gate pre-install completo | Task 5 |
+| V10 | Test de `plugins_remove` con profile dir real | Task 4 |
+| #12 | Test de versión actualizado en el bump | Task 7 |
+| #15 | `source --lib` | Task 3 |
+| #8 | Test de Task 5 con comportamiento real | Task 5 |
+| #1 | `read_stable_bytes()` eliminada | Global Constraints |
 
-**Deliberadamente fuera de alcance** (no en el spec original tampoco): `--json`, `--quiet`, `--dry-run`, `--workspace`/`--session` en `scan` más allá de lo ya implementado en Fase 1+2, `--include-live` con lectura estable de logs vivos (documentado como diferencia deliberada respecto al `readStableFile` real del harness — timeout acotado en vez de loop infinito).
+**2. Placeholders**: ninguno. Los fixes más críticos (D1, R1, R5, P4, A1, A2, V7/A5, V8, V6, V11) fueron validados ejecutándolos en sandboxes descartables o leyendo el código real (`dsh.service` unit) antes de escribirse.
 
-**2. Placeholders**: ninguno — cada paso tiene código o comando exacto. Los tests que dependen de bind de socket (Task 1 y 6, chequeo de "DSH corriendo") documentan explícitamente el fallback a `skip` si el sandbox de CI no permite el bind, sin dejarlo como instrucción vaga.
+**3. Consistencia**: `require_dsh_stopped()` (Task 1) reutilizada en Task 6. `invalidate_projcache_entry()` con igualdad exacta de `id`. `restart_dsh()` (Task 4) usada por `plugins_install()` (Task 5, siempre corre porque ese hook solo aplica al profile `web`) y `plugins_remove()` (condicionada a `profile = "web"`, único profile que `dsh.service` sirve). `session_backup_guard()` (Task 3) con contrato 0/1/3 fijo, consumida simétricamente por Task 4 (`remove`) y Task 5 (`install`). `repair_events()` (Task 6) ahora propaga el estado torn en vez de ignorarlo.
 
-**3. Consistencia de tipos**: `invalidate_projcache_entry()` se define en Task 1 y se reutiliza en Task 6. `require_dsh_stopped()` se define en Task 1 y se reutiliza en Task 6. `restart_dsh()` se extrae en Task 4 y la usa tanto `plugins_install()` (ya existente, modificada) como `plugins_remove()` (nueva). `session_backup_guard()` se define en Task 3 y la consumen Task 4 (`plugins_remove`) y Task 5 (post-check, indirectamente vía `session_backup_scan`). El contrato `sessions[].{workspace,directory,artifact,id,...}` de `MANIFEST.json` (ya fijado en Fase 1+2) se reutiliza sin cambios en `cmd_restore_plan`.
+**4. Nota sobre las críticas tardías recibidas durante la escritura**: durante la redacción final de esta v2 llegaron varios reportes de un swarm de revisión ya formalmente cerrado (rondas 4, 5 y 6, sobre `restore`, `repair` y `plugins_remove` respectivamente). La mayoría de sus hallazgos (D2, D3, D4, R2, R3, R4, P1, P2, P3) ya estaban resueltos en esta v2 porque coincidían con hallazgos ya aplicados del arbitraje formal — el swarm crítico solo tenía visibilidad de la v1. Se verificó cada hallazgo de forma independiente antes de descartarlo o aplicarlo; **D1, R1, R5, P4 y P5 eran genuinamente nuevos** y se integraron con evidencia ejecutada.
