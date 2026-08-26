@@ -1009,6 +1009,80 @@ sys.exit(0 if any(s['id'] == '$sid' for s in m['sessions']) else 1)
   echo "prune: $deleted snapshot(s) borrado(s), $protected protegido(s) por ser la unica copia de una sesion broken"
 }
 
+# Gate compartido, READ-ONLY. Contrato: 0=sin impacto, 1=error duro,
+# 3=impacto detectado (el LLAMADOR decide backup+confirmacion).
+session_backup_guard() {
+  local accion="$1" pkg_dir="$2" profile="$3"
+  session_backup_preflight || return 1
+
+  local sessions_dir="$DSH_HOME/sessions"
+  [ -d "$sessions_dir" ] || return 0
+
+  local pkg_types
+  pkg_types="$(python3 - "$pkg_dir" <<'PY'
+import sys, os, re
+APPEND_LITERAL = re.compile(r'append\(\s*"([a-z][a-z0-9-]*/[a-z0-9/-]+)"')
+VOCAB_MARKER = "KNOWN_SESSION_EVENT_TYPES"
+pkg_dir = sys.argv[1]
+lib = os.path.join(pkg_dir, "lib")
+types = set()
+if os.path.isdir(lib):
+    for root, _, files in os.walk(lib):
+        for name in files:
+            if not name.endswith(".js"):
+                continue
+            try:
+                with open(os.path.join(root, name), encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+            except OSError:
+                continue
+            if VOCAB_MARKER not in src:
+                continue
+            types.update(APPEND_LITERAL.findall(src))
+print("\n".join(sorted(types)))
+PY
+)" || return 1
+
+  if [ -z "$pkg_types" ]; then
+    return 0
+  fi
+
+  local scan_args=(
+    "$DSH_MANAGE_DIR/plugins/session-scan.py" scan
+    --sessions "$sessions_dir"
+    --harness "$(dsh_session_lib_path)"
+  )
+  local profile_nm="$DSH_HOME/profiles/$profile/node_modules"
+  [ -d "$profile_nm" ] && scan_args+=(--profile-node-modules "$profile_nm")
+  local scan_json
+  scan_json="$(python3 "${scan_args[@]}")" || return 1
+
+  local affected
+  affected="$(python3 -c "
+import json, sys
+scan = json.loads(sys.argv[1])
+pkg_types = set(sys.argv[2].splitlines())
+hits = []
+for s in scan['sessions']:
+    types_here = {u['type'] for u in s.get('unknownTypes', [])}
+    if types_here & pkg_types:
+        hits.append(s['id'])
+print(len(hits))
+for h in hits:
+    print(h)
+" "$scan_json" "$pkg_types")"
+
+  local n_affected
+  n_affected="$(echo "$affected" | head -1)"
+  if [ "$n_affected" -eq 0 ] 2>/dev/null; then
+    return 0
+  fi
+
+  echo "⚠ esta operacion ($accion) afecta a $n_affected sesion(es):"
+  echo "$affected" | tail -n +2 | sed 's/^/    /'
+  return 3
+}
+
 # Despachador de los subcomandos de session-backup.
 session_backup() {
   local sub="${1:-}"

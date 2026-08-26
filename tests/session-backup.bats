@@ -614,3 +614,47 @@ time.sleep(2)
   [ ! -d "$viejo" ]
   [ -d "$snap" ]
 }
+
+# --- Task 3: session_backup_guard (gate compartido, read-only) ---
+
+@test "session_backup_guard detecta cuando un paquete a remover deja sesiones broken" {
+  install_fake_harness 48
+  nm="$BATS_TEST_TMPDIR/nm-guard"
+  fake_plugin "$nm" "plugin-guard-test" "guard/evento"
+  fake_session "$DSH_HOME/sessions" "--ws-g1--" "session-g1" "session-g1" \
+    '{"type":"guard/evento","seq":1,"time":1,"data":{}}'
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard remove "$nm/plugin-guard-test" web
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"session-g1"* ]] || [[ "$output" == *"1"* ]]
+}
+
+@test "session_backup_guard no bloquea cuando no hay sesiones afectadas" {
+  install_fake_harness 48
+  nm="$BATS_TEST_TMPDIR/nm-guard2"
+  fake_plugin "$nm" "plugin-sin-uso" "sinuso/evento"
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard remove "$nm/plugin-sin-uso" web
+  [ "$status" -eq 0 ]
+}
+
+@test "session_backup_guard nunca escribe nada (es read-only)" {
+  install_fake_harness 48
+  nm="$BATS_TEST_TMPDIR/nm-guard3"
+  fake_plugin "$nm" "plugin-guard-ro" "guardro/evento"
+  fake_session "$DSH_HOME/sessions" "--ws-g3--" "session-g3" "session-g3" \
+    '{"type":"guardro/evento","seq":1,"time":1,"data":{}}'
+  # El find abajo recorre $DSH_BACKUP_ROOT; creamos el directorio (vacio) para
+  # que find no devuelva 1 y dispare el `set -euo pipefail` que activa
+  # `source --lib`. Solo lectura: se compara la lista de ARCHIVOS antes/despues.
+  mkdir -p "$DSH_BACKUP_ROOT"
+  before="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" -type f 2>/dev/null | sort)"
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard remove "$nm/plugin-guard-ro" web
+  [ "$status" -eq 3 ]
+  after="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" -type f 2>/dev/null | sort)"
+  [ "$before" = "$after" ]
+}
