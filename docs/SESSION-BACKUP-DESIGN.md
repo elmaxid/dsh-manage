@@ -621,6 +621,63 @@ implementación de esta enmienda pertenece al plan que construya `restore`.
 
 ---
 
+## 7.3 Enmienda: gate de `repair --mark-ignorable` SUPERADO
+
+El §5.5 dejaba esto como precondición no verificada: *"Gate de validación
+previo a shipear (no dar por hecho que funciona)"*. Se ejecutó contra el
+harness real instalado (`dsh-session@0.1.1-rc.2`), no simulado:
+
+1. Copia de la sesión real rota (`session-67436620…`, vpn-monitor-mke, 6812
+   filas de storage / 34789 eventos tras expandir chunks) a un sandbox.
+2. Los 80 eventos `swarm/*` marcados con `ignorable: true` — **copiando byte a
+   byte las líneas no tocadas** (nunca re-serializando JSON de lo que no se
+   marca; ver la regla del §5.5 sobre por qué round-trip completo por
+   `json.dumps` no vale el riesgo — se comprobó en la práctica: un primer
+   intento que reserializó todo dio 6732 líneas con diferencia byte a byte
+   aunque el contenido semántico era idéntico).
+3. Verificado con `sessionLib.decodeStorageRecord()` **real, importado del
+   harness instalado** (nunca reimplementado — un primer intento con lógica
+   propia dio 1319 falsos "rechazados" por no expandir `text-chunks`/
+   `reasoning-chunks` antes de chequear tipos, el mismo error que motivó
+   reescribir la v1 del plan de Fase 1+2).
+
+**Resultado**: 34789 eventos, **0 rechazados**. Round-trip lossless confirmado
+(0 líneas con diferencia inesperada fuera de las marcadas). Frame zstd válido.
+
+**Consecuencia de diseño**: `repair --mark-ignorable` (Fase 5, §7) puede
+entrar al plan de implementación con confianza — no como "TBD pendiente de
+gate". `adoptSessionEvent` no interviene en el chequeo de tipos (ver su cuerpo,
+solo hace `deepFreeze` sobre datos de mensaje conocidos), así que no hay
+rechazo adicional en la normalización que el escaneo de tipos no capture ya.
+
+## 7.4 Enmienda: alcance del plan de Fases 3-5 (decisión del usuario)
+
+Tres decisiones que fijan el alcance del plan de implementación siguiente,
+tomadas explícitamente (no asumidas):
+
+1. **Un solo plan cubre las 3 fases** (`restore`+`prune`+`gate_guard` / el
+   gate de `plugins-install`+`plugins-remove` / `repair`), no planes
+   separados. Cierra el diseño completo del documento de una vez.
+2. **`plugins_remove()` SÍ ejecuta `pnpm remove` + restart de `dsh.service`**
+   (no se limita a avisar y delegar el comando al operador). Se justifica
+   porque, a diferencia del patch a `dsh-swarm-panel` de la v1 de Fase 1+2
+   (que resultó ser un no-op — el harness descarta `ignorable` en `append()`,
+   así que reiniciar producción no tenía efecto alguno), acá el restart *sí*
+   tiene un efecto real y necesario: activar el profile con el plugin
+   efectivamente removido. Se exige con las mismas mitigaciones que el
+   arbitraje de Fase 1+2 pidió para ese caso (A1): backup automático antes del
+   restart, confirmación obligatoria (`--yes` en no-interactivo, aborta sin
+   TTY), verificación post-restart con el mismo patrón que `plugins_install`
+   ya usa (`wait_for_port` + grep de errores conocidos en el log), sin rama de
+   rollback automático pero con el snapshot pre-remove ya disponible para
+   `restore` manual si algo sale mal.
+3. **Ronda de crítica con swarm, mismo proceso que Fase 1+2**: 3 críticos
+   (`glm-5.2` correctitud, `codex-gpt56-sol` ejecutabilidad, `ox-alpha`
+   riesgo) + árbitro (`claude-opus-5`) antes de implementar. Este plan es más
+   riesgoso que Fase 1+2 — `restore` y `repair` modifican sesiones reales, y
+   `plugins_remove` reinicia producción — amerita el mismo rigor que encontró
+   2 fallos serios la vez anterior.
+
 ## 8. Riesgos residuales
 
 1. **`repair` es lossy.** Los eventos marcados dejan de interpretarse. La
