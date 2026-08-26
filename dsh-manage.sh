@@ -810,13 +810,27 @@ session_backup_restore() {
   session_backup_verify_dir "$snap" || { echo "snapshot invalido, abortando restore" >&2; return 1; }
 
   echo "creando backup del estado actual antes de restaurar..."
-  # Best-effort, nunca fatal: el backup previo puede fallar (rc=1) si el
-  # estado actual esta corrupto — que es JUSTAMENTE el caso que restore viene
-  # a reparar, asi que no debe abortar el restore. Se advierte y se sigue.
+  # rc=0 (respaldo normal) o rc=2 (nada que respaldar) son ambos "seguir".
+  # Cualquier otro rc es un fallo real (preflight, flock, colision de
+  # nombre, o el snapshot no valida por session_backup_verify_dir) -- por
+  # default esto ABORTA, como protege contra fallos genuinos del backup.
+  #
+  # Excepcion, gateada por --force: el propio estado actual puede estar
+  # corrupto (justamente el caso que restore existe para reparar), y en
+  # ese escenario verify_dir hace fallar el backup con rc=1 aunque no haya
+  # ningun problema ajeno. --force ya significa "se lo que hago, segui
+  # adelante" en el resto de esta funcion (pisar un destino que difiere);
+  # aplicamos la misma semantica acá: solo con --force se tolera que el
+  # backup previo no se haya podido completar, y se advierte sin abortar.
   local backup_rc=0
   session_backup_create --label "pre-restore-$(date -u +%Y%m%dT%H%M%SZ)" || backup_rc=$?
-  if [ "$backup_rc" -ne 0 ]; then
-    echo "aviso: el backup previo no se completo (rc=$backup_rc); continuando el restore igualmente" >&2
+  if [ "$backup_rc" -ne 0 ] && [ "$backup_rc" -ne 2 ]; then
+    if [ "$force" -eq 1 ]; then
+      echo "aviso: el backup previo no se completo (rc=$backup_rc); --force fue pasado, continuando igualmente" >&2
+    else
+      echo "fallo el backup previo (rc=$backup_rc); abortando restore sin tocar nada. Si el estado actual esta corrupto y es justamente lo que queres reparar, repeti con --force." >&2
+      return 1
+    fi
   fi
 
   umask 077
@@ -827,7 +841,9 @@ session_backup_restore() {
   plan="$(python3 "${plan_args[@]}")" || return 1
 
   local count=0
-  while IFS=$'\t' read -r src dst directory sid; do
+  # "directory" se recibe del python (mismo formato de fila que el resto de
+  # los campos) pero esta funcion no lo necesita -- se descarta a proposito.
+  while IFS=$'\t' read -r src dst _directory sid; do
     [ -n "$src" ] || continue
 
     if [ "$to_new_id" -eq 1 ]; then
@@ -835,7 +851,8 @@ session_backup_restore() {
       new_id="session-$(python3 -c 'import uuid; print(uuid.uuid4())')"
       new_dir="$(cd "$(dirname "$dst")/.." && pwd)/$new_id"
       mkdir -p "$new_dir"
-      local rewritten="$new_dir/$(basename "$dst")"
+      local rewritten
+      rewritten="$new_dir/$(basename "$dst")"
       local tmp_plain="${rewritten}.plain"
       python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" restore-new-id \
         --artifact "$src" --new-id "$new_id" --out "$tmp_plain" || { rm -f "$tmp_plain"; return 1; }
