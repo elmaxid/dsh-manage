@@ -39,7 +39,7 @@ set -euo pipefail
 # Versión del propio script de gestión (no la de @deepseek-ai/dsh — esa es
 # installed_version/latest_version más abajo). Semver, sin 'v'; el CLI la
 # imprime con 'v' delante. Ver CHANGELOG.md por release.
-DSH_MANAGE_VERSION="1.2.0"
+DSH_MANAGE_VERSION="1.3.0"
 
 DSH_NODE="${DSH_NODE:-$HOME/.local/dsh-node/node24/bin}"
 # Directorio de trabajo/log/pid DE ESTE SCRIPT — NO confundir con DSH_HOME,

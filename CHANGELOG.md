@@ -3,6 +3,36 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/),
 versionado según [SemVer](https://semver.org/lang/es/).
 
+## [1.3.0] - 2026-08-26
+
+### Actualizado (stack de plugins homologado)
+
+`plugins/manifest.json` alineado con el profile web real tras verificar las
+actualizaciones en el puesto (boot limpio, HTTP 200, peers contra el harness
+0.1.1-rc.2):
+
+- `dsh-context` ^0.33.1 · `dshmarket` ^1.31.1 · `dsh-defend` ^0.2.0
+- `dsh-test-drive` ^0.3.0 · `dsh-tool-describe-image` ^0.5.1
+- `dsh-graphlint` ^0.3.1 · `dsh-lsp-actions` ^0.3.4
+- `@akslcw/dsh-negative-ledger` ^0.1.2
+- `@perrylink/dsh-skill-pack-security-provider` ^2.2.0
+- `@linxin666/dsh-ssh` · `dsh-client-ui-git-graph` · `dsh-client-ui-plugin-manager`
+  · `dsh-client-ui-skill-explorer` → ^0.3.5
+- `dsh-better-sidebar` ^0.16.1
+
+### Agregado
+
+- `dsh-usage-monitor` ^0.1.1 — dashboard de uso de tokens en Settings → Usage
+  (probado en el profile web, boot limpio).
+- `@huanlin/dsh-plugin-better-locale` ^0.1.0 — peer nuevo que exige
+  `dsh-better-sidebar` 0.16.1; se instala como dependencia (no como bundle).
+
+### Cambiado
+
+- `dsh-doublecheck`: actualizada la razón de exclusión — ya no es por peer
+  incompatible (0.9.0 encaja con el harness), sino por decisión del usuario de
+  mantenerlo fuera del stack.
+
 ## [1.2.0] - 2026-08-25
 
 ### Agregado
