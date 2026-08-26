@@ -15,6 +15,7 @@
     "dsh-defend": "^0.2.0",
     "dsh-graphlint": "^0.3.1",
     "dsh-guardian": "0.1.0-alpha.2",
+    "dsh-kimicode-swarm": "^0.1.0",
     "dsh-lsp-actions": "^0.3.4",
     "dsh-plugin-clinic": "^0.1.2",
     "dsh-plugin-gate": "^1.2.0",
@@ -50,7 +51,8 @@
     "dsh-test-drive",
     "dsh-tool-describe-image",
     "dsh-context",
-    "dsh-usage-monitor"
+    "dsh-usage-monitor",
+    "dsh-kimicode-swarm"
   ],
   "excluded": {
     "dsh-doublecheck": "Excluido por decisión del usuario (2026-08-26), no por incompatibilidad: las versiones 0.7.1 (instalada) y 0.9.0 (latest) son compatibles con el harness 0.1.1-rc.2, pero el usuario prefirió mantenerlo fuera del stack de momento.",
@@ -83,6 +85,11 @@
       "prefixes": ["swarm/"],
       "installedVersion": "0.1.0",
       "note": "Registra su vocabulario en KNOWN_SESSION_EVENT_TYPES como efecto de ciclo de vida: al descargarlo, las sesiones con eventos swarm/* dejan de cargar (SessionFormatUnsupportedError). NO se puede arreglar parcheando el plugin: Session.append() de dsh-session 0.1.1-rc.2 descarta el flag ignorable (lib/index.js:1444, arma el envelope solo con sourceEventSeqs y surfaceOp). El fix es del harness y hoy existe unicamente en master, sin acompanar ninguna rc publicada. Hasta entonces el camino es: backup antes de desinstalar, y reinstalar el plugin para volver a leer esas sesiones."
+    },
+    "dsh-kimicode-swarm": {
+      "prefixes": ["swarm/progress"],
+      "installedVersion": "0.1.0",
+      "note": "Escribe el evento de sesion 'swarm/progress' (progreso en vivo de swarm_batch) via session.append en el host half (lib/index.js:1657). Al descargarlo, las sesiones con eventos swarm/progress dejan de cargar (SessionFormatUnsupportedError), el mismo problema que dsh-swarm-panel: Session.append() de dsh-session 0.1.1-rc.2 descarta el flag ignorable. Backup antes de desinstalar."
     }
   },
   "allowScripts": "@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs",

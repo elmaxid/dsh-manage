@@ -26,6 +26,10 @@ actualizaciones en el puesto (boot limpio, HTTP 200, peers contra el harness
   (probado en el profile web, boot limpio).
 - `@huanlin/dsh-plugin-better-locale` ^0.1.0 — peer nuevo que exige
   `dsh-better-sidebar` 0.16.1; se instala como dependencia (no como bundle).
+- `dsh-kimicode-swarm` ^0.1.0 — batch de sub-agentes paralelos estilo Kimi
+  (herramienta `swarm_batch` + comando `/swarm` + barra de progreso en vivo).
+  Instalado y verificado en el profile web (boot sin errores). Documentado en
+  `sessionEventWriters` porque escribe el evento `swarm/progress`.
 
 ### Cambiado
 
