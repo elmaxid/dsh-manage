@@ -736,6 +736,150 @@ session_backup_verify() {
   echo "OK — $snap integro"
 }
 
+# Chequeo obligatorio antes de restore/repair. Se llama DOS VECES: al inicio
+# (falla rapido) y de nuevo justo antes del mv -T final.
+require_dsh_stopped() {
+  local pid
+  pid="$(port_pid)"
+  if [ -n "$pid" ]; then
+    echo "dsh esta corriendo (pid $pid en :$DSH_PORT). Detenelo primero:" >&2
+    echo "  systemctl stop dsh.service   # si esta gestionado por systemd" >&2
+    echo "  dsh-manage stop               # si no" >&2
+    return 1
+  fi
+}
+
+# Invalida la entrada de una sesion en session_projcache.json. Igualdad
+# EXACTA de id -- este host tiene ids con y sin el prefijo "session-"
+# coexistiendo, y un match por endswith/prefijo puede borrar de mas.
+invalidate_projcache_entry() {
+  local session_id="$1"
+  local cache="$DSH_HOME/storages/session_projcache.json"
+  [ -f "$cache" ] || return 0
+  python3 -c "
+import json, os, sys
+path = sys.argv[1]
+sid = sys.argv[2]
+with open(path, encoding='utf-8') as f:
+    d = json.load(f)
+sessions = d.get('tables', {}).get('sessions', {})
+if sid not in sessions:
+    sys.exit(0)
+del sessions[sid]
+tmp = path + '.tmp'
+old_umask = os.umask(0o077)
+try:
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f)
+finally:
+    os.umask(old_umask)
+os.replace(tmp, path)
+" "$cache" "$session_id"
+}
+
+# restore: copia sesiones desde un snapshot de vuelta a sessions/.
+session_backup_restore() {
+  local from="latest" session="" force=0 to_new_id=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)
+        [ $# -ge 2 ] || { echo "falta el valor de --from" >&2; return 1; }
+        from="$2"; shift 2 ;;
+      --session)
+        [ $# -ge 2 ] || { echo "falta el valor de --session" >&2; return 1; }
+        session="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      --to-new-id) to_new_id=1; shift ;;
+      *) echo "opcion desconocida para restore: $1" >&2; return 1 ;;
+    esac
+  done
+
+  session_backup_preflight || return 1
+  require_dsh_stopped || return 1
+
+  local snap="$DSH_BACKUP_ROOT/$from"
+  [ -e "$snap" ] || { echo "snapshot no encontrado: $snap" >&2; return 1; }
+  # CRITICO: resolver el symlink a una ruta ABSOLUTA REAL ahora, antes de
+  # tocar nada. "latest" es un symlink que session_backup_create() (el
+  # backup implicito de mas abajo) va a re-apuntar al terminar -- si $snap
+  # siguiera siendo la ruta "via latest" en vez de la ruta resuelta, el
+  # resto de esta funcion leeria el backup implicito recien creado en vez
+  # del snapshot original.
+  snap="$(readlink -f "$snap")"
+  [ -d "$snap" ] || { echo "snapshot no encontrado tras resolver: $snap" >&2; return 1; }
+  session_backup_verify_dir "$snap" || { echo "snapshot invalido, abortando restore" >&2; return 1; }
+
+  echo "creando backup del estado actual antes de restaurar..."
+  # Best-effort, nunca fatal: el backup previo puede fallar (rc=1) si el
+  # estado actual esta corrupto — que es JUSTAMENTE el caso que restore viene
+  # a reparar, asi que no debe abortar el restore. Se advierte y se sigue.
+  local backup_rc=0
+  session_backup_create --label "pre-restore-$(date -u +%Y%m%dT%H%M%SZ)" || backup_rc=$?
+  if [ "$backup_rc" -ne 0 ]; then
+    echo "aviso: el backup previo no se completo (rc=$backup_rc); continuando el restore igualmente" >&2
+  fi
+
+  umask 077
+  local sessions_dir="$DSH_HOME/sessions"
+  local plan_args=("$DSH_MANAGE_DIR/plugins/session-scan.py" restore-plan --snap-dir "$snap" --sessions "$sessions_dir")
+  [ -n "$session" ] && plan_args+=(--session "$session")
+  local plan
+  plan="$(python3 "${plan_args[@]}")" || return 1
+
+  local count=0
+  while IFS=$'\t' read -r src dst directory sid; do
+    [ -n "$src" ] || continue
+
+    if [ "$to_new_id" -eq 1 ]; then
+      local new_dir new_id
+      new_id="session-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+      new_dir="$(cd "$(dirname "$dst")/.." && pwd)/$new_id"
+      mkdir -p "$new_dir"
+      local rewritten="$new_dir/$(basename "$dst")"
+      local tmp_plain="${rewritten}.plain"
+      python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" restore-new-id \
+        --artifact "$src" --new-id "$new_id" --out "$tmp_plain" || { rm -f "$tmp_plain"; return 1; }
+      if [[ "$rewritten" == *.zstd ]]; then
+        zstd -q -f -o "$rewritten" "$tmp_plain" || { rm -f "$tmp_plain" "$rewritten"; return 1; }
+        rm -f "$tmp_plain"
+      else
+        mv -T "$tmp_plain" "$rewritten"
+      fi
+      count=$((count + 1))
+      continue
+    fi
+
+    if [ -e "$dst" ]; then
+      local cur_sum snap_sum
+      cur_sum="$(sha256sum "$dst" | cut -d' ' -f1)"
+      snap_sum="$(sha256sum "$src" | cut -d' ' -f1)"
+      if [ "$cur_sum" = "$snap_sum" ]; then
+        continue
+      fi
+      if [ "$force" -ne 1 ]; then
+        echo "'$dst' existe y difiere del snapshot; use --force para pisarlo" >&2
+        return 1
+      fi
+    fi
+
+    require_dsh_stopped || { echo "dsh arranco durante el restore; abortando antes de escribir $dst" >&2; return 1; }
+
+    mkdir -p "$(dirname "$dst")"
+    local tmp="${dst}.restore-tmp"
+    cp "$src" "$tmp"
+    mv -T "$tmp" "$dst"
+    invalidate_projcache_entry "$sid" || true
+    count=$((count + 1))
+  done < <(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+for r in d['restores']:
+    print(f\"{r['src']}\t{r['dst']}\t{r['directory']}\t{r['id']}\")
+" "$plan")
+
+  echo "restore completo: $count archivo(s) restaurado(s) desde $snap"
+}
+
 # Despachador de los subcomandos de session-backup.
 session_backup() {
   local sub="${1:-}"
@@ -745,7 +889,8 @@ session_backup() {
     create)   session_backup_create "$@" ;;
     list)     session_backup_list "$@" ;;
     verify)   session_backup_verify "$@" ;;
-    *) echo "uso: $0 session-backup {scan|create|list|verify}"; return 1 ;;
+    restore)  session_backup_restore "$@" ;;
+    *) echo "uso: $0 session-backup {scan|create|list|verify|restore}"; return 1 ;;
   esac
 }
 
@@ -870,5 +1015,5 @@ case "${1:-}" in
   version)          version ;;
   check-update)     check_update ;;
   --version|-V)     echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
-  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify}|version|check-update}"; exit 1 ;;
+  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify|restore}|version|check-update}"; exit 1 ;;
 esac

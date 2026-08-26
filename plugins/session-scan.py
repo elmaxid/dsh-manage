@@ -347,6 +347,51 @@ def cmd_snapshot(args):
     print(f"{len(entries)} sesiones copiadas")
 
 
+def cmd_restore_plan(args):
+    """Calcula que copiar para un restore, sin ejecutar nada."""
+    manifest_path = os.path.join(args.snap_dir, "MANIFEST.json")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    plan = []
+    for row in manifest["sessions"]:
+        if args.session and row["id"] != args.session and row["directory"] != args.session:
+            continue
+        rel = os.path.join("sessions", row["workspace"], row["directory"], row["artifact"])
+        src = os.path.join(args.snap_dir, rel)
+        dst = os.path.join(args.sessions, row["workspace"], row["directory"], row["artifact"])
+        plan.append({"id": row["id"], "workspace": row["workspace"],
+                     "directory": row["directory"], "src": src, "dst": dst})
+    if args.session and not plan:
+        raise SystemExit(f"la sesion '{args.session}' no esta en este snapshot")
+    json.dump({"restores": plan}, sys.stdout, indent=2)
+    print()
+
+
+def rewrite_header_id(src_path, new_id):
+    """Devuelve el contenido con el id del header (primera linea) reescrito.
+    Las demas lineas se preservan byte a byte -- copiar el artefacto sin
+    tocar el header produce una sesion que el harness rechaza al abrir
+    (assertStoredIdentity compara la ruta con meta.id/meta.cwd del header)."""
+    if src_path.endswith(".zstd"):
+        raw = subprocess.run(["zstd", "-dc", src_path], capture_output=True).stdout.decode("utf-8", errors="replace")
+    else:
+        with open(src_path, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    lines = raw.splitlines()
+    if not lines:
+        raise SystemExit(f"artefacto vacio: {src_path}")
+    header = json.loads(lines[0])
+    header["id"] = new_id
+    lines[0] = json.dumps(header, ensure_ascii=False)
+    return "\n".join(lines) + "\n"
+
+
+def cmd_restore_new_id(args):
+    content = rewrite_header_id(args.artifact, args.new_id)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="session-scan.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -367,6 +412,17 @@ def main():
     p.add_argument("--snap-dir", required=True)
     p.add_argument("--sessions", required=True)
     p.set_defaults(func=cmd_snapshot)
+    p = sub.add_parser("restore-plan", help="calcula que copiar para un restore (uso interno)")
+    p.add_argument("--snap-dir", required=True)
+    p.add_argument("--sessions", required=True)
+    p.add_argument("--session", default=None, help="limitar a una sesion (id o directory)")
+    p.set_defaults(func=cmd_restore_plan)
+
+    p = sub.add_parser("restore-new-id", help="reescribe el id del header (uso interno)")
+    p.add_argument("--artifact", required=True)
+    p.add_argument("--new-id", required=True)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_restore_new_id)
     args = parser.parse_args()
     args.func(args)
 

@@ -410,3 +410,106 @@ assert m['dshManageVersion'] == '1.2.0', m['dshManageVersion']
 "
   [ "$status" -eq 0 ]
 }
+
+@test "restore exige DSH detenido" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r1--" "session-r1" "session-r1" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r1
+  python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', 39217))
+s.listen(1)
+time.sleep(2)
+" &
+  listener_pid=$!
+  sleep 0.3
+  run env DSH_PORT=39217 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"corriendo"* ]] || [[ "$output" == *"detene"* ]]
+}
+
+@test "restore --from latest restaura el snapshot que existia al invocar, no el backup implicito posterior" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r0--" "session-r0" "session-r0" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-bueno
+  printf 'ESTADO-ROTO' > "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd"
+  run env DSH_PORT=39227 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
+  [ "$status" -eq 0 ]
+  run zstd -t "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+  content="$(zstd -dc "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd")"
+  [[ "$content" != *"ESTADO-ROTO"* ]]
+  [[ "$content" == *'"type":"tipo/1"'* ]]
+}
+
+@test "restore sin DSH corriendo restaura una sesion desde el snapshot" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r2--" "session-r2" "session-r2" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r2
+  printf 'CORRUPTO' > "$DSH_HOME/sessions/--ws-r2--/session-r2/session.jsonl.zstd"
+  run env DSH_PORT=39218 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
+  [ "$status" -eq 0 ]
+  run zstd -t "$DSH_HOME/sessions/--ws-r2--/session-r2/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+}
+
+@test "restore sin --force no pisa un destino que difiere" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r3--" "session-r3" "session-r3" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r3
+  printf 'CORRUPTO' > "$DSH_HOME/sessions/--ws-r3--/session-r3/session.jsonl.zstd"
+  run env DSH_PORT=39222 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r3
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--force"* ]]
+  [ "$(cat "$DSH_HOME/sessions/--ws-r3--/session-r3/session.jsonl.zstd")" = "CORRUPTO" ]
+}
+
+@test "restore --session limita a una sola sesion" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r4--" "session-r4a" "session-r4a" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  fake_session "$DSH_HOME/sessions" "--ws-r4--" "session-r4b" "session-r4b" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r4
+  printf 'CORRUPTO-A' > "$DSH_HOME/sessions/--ws-r4--/session-r4a/session.jsonl.zstd"
+  printf 'CORRUPTO-B' > "$DSH_HOME/sessions/--ws-r4--/session-r4b/session.jsonl.zstd"
+  run env DSH_PORT=39219 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r4a --force
+  [ "$status" -eq 0 ]
+  run zstd -t "$DSH_HOME/sessions/--ws-r4--/session-r4a/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$DSH_HOME/sessions/--ws-r4--/session-r4b/session.jsonl.zstd")" = "CORRUPTO-B" ]
+}
+
+@test "restore --to-new-id reescribe el id del header, no solo el directorio" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r5--" "session-r5" "session-r5" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r5
+  run env DSH_PORT=39220 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r5 --to-new-id
+  [ "$status" -eq 0 ]
+  new_dir="$(find "$DSH_HOME/sessions/--ws-r5--" -mindepth 1 -maxdepth 1 -type d ! -name session-r5)"
+  [ -n "$new_dir" ]
+  new_id="$(zstd -dc "$new_dir/session.jsonl.zstd" | head -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  [ "$new_id" != "session-r5" ]
+  [[ "$new_id" == session-* ]]
+}
+
+@test "restore con sessions vacio no aborta por 'nada que respaldar' del backup implicito" {
+  install_fake_harness 48
+  mkdir -p "$DSH_BACKUP_ROOT"
+  fake_session "$DSH_HOME/sessions" "--ws-r6--" "session-r6" "session-r6" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-con-datos
+  rm -rf "${DSH_HOME:?}/sessions"
+  mkdir -p "$DSH_HOME/sessions"
+  run env DSH_PORT=39223 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
+  [ "$status" -eq 0 ]
+  [ -f "$DSH_HOME/sessions/--ws-r6--/session-r6/session.jsonl.zstd" ]
+}
