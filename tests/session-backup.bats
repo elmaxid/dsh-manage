@@ -856,3 +856,27 @@ EOF
   [ "$status" -eq 0 ]
   [[ "$output" != *"opcion desconocida"* ]]
 }
+
+@test "plugins_install aborta sin instalar nada si el gate pre-install falla con error duro" {
+  # Deliberadamente SIN install_fake_harness: session_backup_preflight()
+  # falla porque el harness no esta instalado, asi que
+  # session_backup_guard() devuelve rc=1 (error duro) para el primer
+  # paquete del manifest -- plugins_install debe abortar ahi, no
+  # continuar con pnpm install (fail-open seria instalar sin resguardo
+  # cuando el propio chequeo de seguridad esta roto).
+  printf '#!/bin/sh\nexit 0\n' > "$DSH_NODE/dsh"
+  chmod +x "$DSH_NODE/dsh"
+  printf '#!/bin/sh\nexit 0\n' > "$DSH_NODE/pnpm"
+  chmod +x "$DSH_NODE/pnpm"
+  mkdir -p "$DSH_HOME/profiles/web/node_modules/algun-plugin"
+  manifest="$BATS_TEST_TMPDIR/manifest-gate-hard-error.json"
+  cat > "$manifest" <<EOF
+{"dependencies":{"algun-plugin":"1.0.0"},"bundles":[]}
+EOF
+  run bash -c "
+    export DSH_MANIFEST='$manifest'
+    source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && plugins_install web
+  "
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"gate de resguardo"* ]] || [[ "$output" == *"no se pudo leer"* ]] || [[ "$output" == *"harness"* ]]
+}

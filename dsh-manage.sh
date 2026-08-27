@@ -368,13 +368,17 @@ plugins_install() {
   manifest_pkgs="$(node -e "
     const m = require('$DSH_MANIFEST');
     console.log(Object.keys(m.dependencies || {}).join('\n'));
-  " 2>/dev/null)"
+  ")" || { echo "no se pudo leer $DSH_MANIFEST para el gate de resguardo; abortando plugins-install" >&2; return 1; }
   local pkg any_impact=0
   for pkg in $manifest_pkgs; do
     local installed_dir="$profile_dir/node_modules/$pkg"
     [ -d "$installed_dir" ] || continue
     local guard_rc=0
     session_backup_guard install "$installed_dir" "$profile" || guard_rc=$?
+    if [ "$guard_rc" -eq 1 ]; then
+      echo "el gate de resguardo fallo con un error duro sobre '$pkg'; abortando plugins-install sin instalar nada" >&2
+      return 1
+    fi
     if [ "$guard_rc" -eq 3 ]; then
       any_impact=1
     fi
