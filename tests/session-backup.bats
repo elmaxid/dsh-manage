@@ -755,3 +755,71 @@ time.sleep(2)
   leftovers="$(find "$DSH_HOME/sessions" -name '*.repair-*' 2>/dev/null | wc -l)"
   [ "$leftovers" -eq 0 ]
 }
+
+# --- Task 4: plugins_remove con restart mitigado ---
+
+@test "plugins_remove sin --yes y sin TTY aborta sin tocar nada" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/web/node_modules/paquete-inexistente"
+  cat > "$DSH_HOME/profiles/web/package.json" <<'EOF'
+{"name":"web","dependencies":{"paquete-inexistente":"1.0.0"}}
+EOF
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-inexistente web < /dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--yes"* ]] || [[ "$output" == *"TTY"* ]]
+}
+
+@test "plugins_remove con paquete no declarado en package.json falla limpio" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/web"
+  echo '{"name":"web","dependencies":{}}' > "$DSH_HOME/profiles/web/package.json"
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-que-no-existe web --yes
+  [ "$status" -ne 0 ]
+}
+
+@test "guard_rc se captura correctamente bajo set -e (no se pierde con impacto detectado)" {
+  install_fake_harness 48
+  nm="$DSH_HOME/profiles/web/node_modules"
+  mkdir -p "$nm/plugin-con-impacto/lib"
+  cat > "$nm/plugin-con-impacto/package.json" <<'EOF'
+{"name":"plugin-con-impacto","version":"1.0.0"}
+EOF
+  cat > "$nm/plugin-con-impacto/lib/index.js" <<'EOF'
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+export function emit(s) { s.append("impacto/evento", {}); }
+EOF
+  cat > "$DSH_HOME/profiles/web/package.json" <<'EOF'
+{"name":"web","dependencies":{"plugin-con-impacto":"1.0.0"}}
+EOF
+  fake_session "$DSH_HOME/sessions" "--ws-gr--" "session-gr" "session-gr" \
+    '{"type":"impacto/evento","seq":1,"time":1,"data":{}}'
+  # Binario dsh FALSO (variante aprobada por el orquestador): este test usa el
+  # profile "web", cuyo camino post-remocion es restart_dsh(). En un host con
+  # un dsh REAL en :3080 (DSH_PORT default), stop() lo mataria y reiniciaria
+  # produccion. Con puerto libre + este falso que sale 1 sin escuchar nada,
+  # start() no dispara una instalacion real y wait_for_port falla en ~1s: el
+  # restart falla rapido y limpio sin tocar el host. El assertion no depende
+  # del restart: verifica la captura de guard_rc=3 bajo set -e y el backup
+  # automatico, que es lo que esta tarea prueba.
+  cat > "$DSH_NODE/dsh" <<'EOF'
+#!/usr/bin/env bash
+# Binario dsh FALSO para este test: nunca debe escuchar de verdad ni instalar
+# nada. Si algo lo invoca, es indicio de que restart_dsh() intento un start()
+# real -- este test verifica el guard/backup automatico, no un restart real.
+exit 1
+EOF
+  chmod +x "$DSH_NODE/dsh"
+  run env DSH_PORT=39230 DSH_START_TIMEOUT=1 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove plugin-con-impacto web --yes
+  [[ "$output" == *"backup automatico"* ]]
+}
+
+@test "plugins_remove no reinicia dsh.service al tocar un profile que no es web" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/repro/node_modules/paquete-en-repro"
+  cat > "$DSH_HOME/profiles/repro/package.json" <<'EOF'
+{"name":"repro","dependencies":{"paquete-en-repro":"1.0.0"}}
+EOF
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-en-repro repro --yes
+  [[ "$output" == *"no hace falta reiniciar dsh"* ]]
+  [[ "$output" != *"reiniciando dsh"* ]]
+}

@@ -289,6 +289,30 @@ dsh_service_manages_this_home() {
   [ -n "$unit_wd" ] && [ "$unit_wd" = "$DSH_MANAGE_HOME" ]
 }
 
+restart_dsh() {
+  echo "reiniciando dsh para activar los cambios..."
+  if dsh_service_manages_this_home; then
+    systemctl restart dsh.service
+    sleep 3
+  else
+    stop || true
+    sleep 1
+    start
+  fi
+
+  if ! wait_for_port; then
+    echo "dsh no quedó escuchando en :$DSH_PORT tras el restart, ver $DSH_LOG" >&2
+    return 1
+  fi
+
+  echo "boot OK, verificando errores conocidos en el log..."
+  if grep -qiE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG"; then
+    echo "⚠ se encontraron mensajes de error conocidos en $DSH_LOG — revisar antes de dar por bueno" >&2
+    grep -iE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG" | tail -20
+    return 1
+  fi
+}
+
 # Instala el stack de plugins homologado (ver plugins/manifest.json) en un
 # profile de dsh. Separado de install() a propósito: install() solo pone el
 # harness base; esto es una capa aparte, pensada para correrse después (o
@@ -359,29 +383,109 @@ plugins_install() {
     (cd "$profile_dir" && PATH="$DSH_NODE:$PATH" pnpm approve-builds $approve_pkgs) || true
   fi
 
-  echo "reiniciando dsh para activar el stack..."
-  if dsh_service_manages_this_home; then
-    systemctl restart dsh.service
-    sleep 3
-  else
-    stop || true
-    sleep 1
-    start
-  fi
-
-  if ! wait_for_port; then
-    echo "dsh no quedó escuchando en :$DSH_PORT tras instalar los plugins, ver $DSH_LOG" >&2
-    return 1
-  fi
-
-  echo "boot OK, verificando errores conocidos en el log..."
-  if grep -qiE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG"; then
-    echo "⚠ se encontraron mensajes de error conocidos en $DSH_LOG — revisar antes de dar por bueno" >&2
-    grep -iE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG" | tail -20
-    return 1
-  fi
+  restart_dsh || return 1
 
   echo "listo: profile '$profile' con el stack de plugins activo en :$DSH_PORT"
+}
+
+plugins_remove() {
+  local pkg="${1:-}" profile="${2:-web}"
+  shift 2 2>/dev/null || true
+  local yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) echo "opcion desconocida para plugins-remove: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [ -z "$pkg" ]; then
+    echo "uso: $0 plugins-remove <paquete> [profile] [--yes]" >&2
+    return 1
+  fi
+
+  local profile_dir="$DSH_HOME/profiles/$profile"
+  if [ ! -d "$profile_dir" ]; then
+    echo "profile no encontrado: $profile_dir" >&2
+    return 1
+  fi
+  if [ ! -f "$profile_dir/package.json" ]; then
+    echo "sin package.json en $profile_dir — nada que remover" >&2
+    return 1
+  fi
+  if ! node -e "
+    const pkg = require('$profile_dir/package.json');
+    const has = (pkg.dependencies && pkg.dependencies['$pkg']) ||
+                (pkg.devDependencies && pkg.devDependencies['$pkg']);
+    process.exit(has ? 0 : 1);
+  " 2>/dev/null; then
+    echo "'$pkg' no esta instalado en el profile '$profile'" >&2
+    return 1
+  fi
+
+  local pkg_dir="$profile_dir/node_modules/$pkg"
+  local guard_rc=0
+  if [ -d "$pkg_dir" ]; then
+    session_backup_guard remove "$pkg_dir" "$profile" || guard_rc=$?
+  fi
+
+  if [ "$guard_rc" -eq 1 ]; then
+    echo "el gate de resguardo fallo con un error duro; abortando plugins-remove sin remover nada" >&2
+    return 1
+  fi
+
+  if [ "$guard_rc" -eq 3 ]; then
+    echo "creando backup automatico antes de continuar (trigger: plugins-remove)..."
+    DSH_TRIGGER="plugins-remove" session_backup_create --only-at-risk \
+      --label "preremove-$(printf '%s' "$pkg" | tr -c 'A-Za-z0-9._-' '-')" || {
+      echo "fallo el backup automatico; abortando plugins-remove" >&2
+      return 1
+    }
+    echo
+    echo "opciones tras remover '$pkg':"
+    echo "  a) reinstalar el plugin para volver a leer esas sesiones"
+    echo "  b) dsh-manage session-backup repair --session <id> --mark-ignorable"
+    echo "     (las sesiones cargan, los eventos de ese plugin se omiten)"
+    echo
+    if [ "$yes" -ne 1 ]; then
+      if [ ! -t 0 ]; then
+        echo "sin --yes y sin TTY: abortando sin remover nada" >&2
+        return 1
+      fi
+      read -r -p "¿remover '$pkg' de todas formas? [y/N] " confirm
+      case "$confirm" in
+        y|Y|yes|si|s) : ;;
+        *) echo "cancelado"; return 1 ;;
+      esac
+    fi
+  elif [ "$yes" -ne 1 ] && [ ! -t 0 ]; then
+    echo "sin --yes y sin TTY: abortando sin remover nada" >&2
+    return 1
+  fi
+
+  echo "removiendo '$pkg' del profile '$profile'..."
+  (cd "$profile_dir" && PATH="$DSH_NODE:$PATH" pnpm remove "$pkg") \
+    || { echo "pnpm remove falló, ver arriba" >&2; return 1; }
+
+  # dsh.service (generado por service_install) siempre sirve el profile
+  # "web" (PROFILE_DIR esta fijo en el unit) -- no hay un dsh.service por
+  # profile. Reiniciar produccion por tocar un profile que NO es el
+  # servido (ej. "repro") seria un impacto no consentido en un server
+  # compartido. Solo reiniciamos si el profile tocado es el productivo.
+  if [ "$profile" = "web" ]; then
+    restart_dsh || return 1
+  else
+    echo "profile '$profile' no es 'web' (el que sirve dsh.service) -- no hace falta reiniciar dsh"
+  fi
+
+  echo "verificando el impacto real tras el restart..."
+  local post_rc=0
+  session_backup_scan --profile "$profile" --fail-on-risk >/dev/null 2>&1 || post_rc=$?
+  if [ "$post_rc" -eq 4 ]; then
+    echo "⚠ hay sesiones 'broken' tras remover '$pkg'. Backup disponible con 'dsh-manage session-backup list'." >&2
+  fi
+
+  echo "listo: '$pkg' removido del profile '$profile'"
 }
 
 # Instala el watchdog systemd de dsh: un unit que lo mantiene arriba
@@ -1328,10 +1432,11 @@ case "${1:-}" in
   status)           status ;;
   install)          install ;;
   plugins-install)  plugins_install "${2:-}" ;;
+  plugins-remove)   plugins_remove "${2:-}" "${3:-web}" "${@:4}" ;;
   service-install)  service_install ;;
   session-backup)   session_backup "${@:2}" ;;
   version)          version ;;
   check-update)     check_update ;;
   --version|-V)     echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
-  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify|restore|prune|repair}|version|check-update}"; exit 1 ;;
+  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|plugins-remove <paquete> [profile] [--yes]|service-install|session-backup {scan|create|list|verify|restore|prune|repair}|version|check-update}"; exit 1 ;;
 esac
