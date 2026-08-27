@@ -648,13 +648,15 @@ time.sleep(2)
     '{"type":"guardro/evento","seq":1,"time":1,"data":{}}'
   # El find abajo recorre $DSH_BACKUP_ROOT; creamos el directorio (vacio) para
   # que find no devuelva 1 y dispare el `set -euo pipefail` que activa
-  # `source --lib`. Solo lectura: se compara la lista de ARCHIVOS antes/despues.
+  # `source --lib`. Solo lectura: se compara TODO (archivos Y directorios,
+  # sin -type f) antes/despues -- un mkdir espurio sin archivos adentro
+  # tambien violaria el contrato read-only y debe detectarse.
   mkdir -p "$DSH_BACKUP_ROOT"
-  before="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" -type f 2>/dev/null | sort)"
+  before="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" 2>/dev/null | sort)"
   # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
   source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
   run session_backup_guard remove "$nm/plugin-guard-ro" web
   [ "$status" -eq 3 ]
-  after="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" -type f 2>/dev/null | sort)"
+  after="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" 2>/dev/null | sort)"
   [ "$before" = "$after" ]
 }

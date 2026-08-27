@@ -1070,7 +1070,7 @@ for s in scan['sessions']:
 print(len(hits))
 for h in hits:
     print(h)
-" "$scan_json" "$pkg_types")"
+" "$scan_json" "$pkg_types")" || return 1
 
   local n_affected
   n_affected="$(echo "$affected" | head -1)"
