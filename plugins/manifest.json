@@ -84,12 +84,12 @@
     "dsh-swarm-panel": {
       "prefixes": ["swarm/"],
       "installedVersion": "0.1.0",
-      "note": "Registra su vocabulario en KNOWN_SESSION_EVENT_TYPES como efecto de ciclo de vida: al descargarlo, las sesiones con eventos swarm/* dejan de cargar (SessionFormatUnsupportedError). NO se puede arreglar parcheando el plugin: Session.append() de dsh-session 0.1.1-rc.2 descarta el flag ignorable (lib/index.js:1444, arma el envelope solo con sourceEventSeqs y surfaceOp). El fix es del harness y hoy existe unicamente en master, sin acompanar ninguna rc publicada. Hasta entonces el camino es: backup antes de desinstalar, y reinstalar el plugin para volver a leer esas sesiones."
+      "note": "Registra su vocabulario en KNOWN_SESSION_EVENT_TYPES como efecto de ciclo de vida: al descargarlo, las sesiones con eventos swarm/* dejan de cargar (SessionFormatUnsupportedError). Esto NO se puede arreglar parcheando el plugin en vivo: Session.append() de dsh-session 0.1.1-rc.2 descarta el flag ignorable (lib/index.js:1444, arma el envelope solo con sourceEventSeqs y surfaceOp) cuando el evento se escribe en caliente. El fix de ese descarte es del harness y hoy existe unicamente en master, sin acompanar ninguna rc publicada. Pero 'dsh-manage session-backup repair --mark-ignorable' SI funciona para sesiones ya escritas: reescribe el JSONL directamente en disco (nunca llama a Session.append()), asi que el flag ignorable que escribe SI es respetado por la ruta de lectura del harness al abrir la sesion. Vias de recuperacion: (a) reinstalar el plugin para volver a leer esas sesiones tal cual, o (b) 'repair --session <id> --mark-ignorable' si preferis no reinstalar (los eventos swarm/* de esa sesion se omiten permanentemente)."
     },
     "dsh-kimicode-swarm": {
       "prefixes": ["swarm/progress"],
       "installedVersion": "0.1.0",
-      "note": "Escribe el evento de sesion 'swarm/progress' (progreso en vivo de swarm_batch) via session.append en el host half (lib/index.js:1657). Al descargarlo, las sesiones con eventos swarm/progress dejan de cargar (SessionFormatUnsupportedError), el mismo problema que dsh-swarm-panel: Session.append() de dsh-session 0.1.1-rc.2 descarta el flag ignorable. Backup antes de desinstalar."
+      "note": "Escribe el evento de sesion 'swarm/progress' (progreso en vivo de swarm_batch) via session.append en el host half (lib/index.js:1657). Al descargarlo, las sesiones con eventos swarm/progress dejan de cargar (SessionFormatUnsupportedError), el mismo problema que dsh-swarm-panel. Mismas vias de recuperacion: reinstalar el plugin, o 'dsh-manage session-backup repair --session <id> --mark-ignorable' (repair reescribe el JSONL en disco sin pasar por Session.append(), asi que el descarte del flag ignorable en escritura-en-vivo no lo afecta). Backup antes de desinstalar."
     }
   },
   "allowScripts": "@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs",
