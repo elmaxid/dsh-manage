@@ -347,6 +347,153 @@ def cmd_snapshot(args):
     print(f"{len(entries)} sesiones copiadas")
 
 
+def cmd_restore_plan(args):
+    """Calcula que copiar para un restore, sin ejecutar nada."""
+    manifest_path = os.path.join(args.snap_dir, "MANIFEST.json")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    plan = []
+    for row in manifest["sessions"]:
+        if args.session and row["id"] != args.session and row["directory"] != args.session:
+            continue
+        rel = os.path.join("sessions", row["workspace"], row["directory"], row["artifact"])
+        src = os.path.join(args.snap_dir, rel)
+        dst = os.path.join(args.sessions, row["workspace"], row["directory"], row["artifact"])
+        plan.append({"id": row["id"], "workspace": row["workspace"],
+                     "directory": row["directory"], "src": src, "dst": dst})
+    if args.session and not plan:
+        raise SystemExit(f"la sesion '{args.session}' no esta en este snapshot")
+    json.dump({"restores": plan}, sys.stdout, indent=2)
+    print()
+
+
+def rewrite_header_id(src_path, new_id):
+    """Devuelve el contenido con el id del header (primera linea) reescrito.
+    Las demas lineas se preservan byte a byte -- copiar el artefacto sin
+    tocar el header produce una sesion que el harness rechaza al abrir
+    (assertStoredIdentity compara la ruta con meta.id/meta.cwd del header)."""
+    if src_path.endswith(".zstd"):
+        raw = subprocess.run(["zstd", "-dc", src_path], capture_output=True).stdout.decode("utf-8", errors="replace")
+    else:
+        with open(src_path, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    lines = raw.splitlines()
+    if not lines:
+        raise SystemExit(f"artefacto vacio: {src_path}")
+    header = json.loads(lines[0])
+    header["id"] = new_id
+    lines[0] = json.dumps(header, ensure_ascii=False)
+    return "\n".join(lines) + "\n"
+
+
+def cmd_restore_new_id(args):
+    content = rewrite_header_id(args.artifact, args.new_id)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def repair_events(artifact, baseline, allowed_types=None):
+    """Marca ignorable:true SOLO en lineas fuera del baseline. El HEADER
+    (primera linea, type=session) NUNCA se toca.
+
+    Aborta (SystemExit) si el artefacto esta TORN (zstd -dc con
+    returncode != 0): read_session_events() (uso de solo lectura, scan) SI
+    tolera una cola rota porque el harness la descarta al cargar -- pero
+    repair REESCRIBE el artefacto, y publicar solo el fragmento recuperado
+    como si fuera el log completo seria perder la cola para siempre sin
+    aviso. Verificado: un artefacto truncado al 70% da returncode=1 y datos
+    parciales que parecen "normales" si no se chequea el codigo de salida.
+    """
+    if artifact.endswith(".zstd"):
+        proc = subprocess.run(["zstd", "-dc", artifact], capture_output=True)
+        if proc.returncode != 0:
+            raise SystemExit(
+                f"el artefacto {artifact} tiene una cola rota (zstd -dc "
+                f"rc={proc.returncode}). repair no puede reescribir un log "
+                f"truncado sin arriesgar perder la cola -- usar restore "
+                f"desde un snapshot previo en su lugar."
+            )
+        raw = proc.stdout.decode("utf-8", errors="replace")
+    else:
+        with open(artifact, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    lines = raw.splitlines()
+    out = []
+    marked = 0
+    header_seen = False
+    for line in lines:
+        if not line.strip():
+            out.append(line)
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            out.append(line)
+            continue
+        kind = row.get("type")
+        if not header_seen and kind == "session":
+            header_seen = True
+            out.append(line)
+            continue
+        is_chunk_row = kind in CHUNK_ROW_TAGS
+        already_ok = kind in baseline or row.get("ignorable") is True or is_chunk_row
+        if already_ok:
+            out.append(line)
+            continue
+        if allowed_types is not None and kind not in allowed_types:
+            out.append(line)
+            continue
+        row["ignorable"] = True
+        out.append(json.dumps(row, ensure_ascii=False))
+        marked += 1
+    return out, marked
+
+
+def cmd_repair(args):
+    baseline = load_baseline(args.harness)
+    allowed = set(args.types.split(",")) if args.types else None
+    lines, marked = repair_events(args.artifact, baseline, allowed)
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"{marked} eventos marcados ignorable:true")
+
+
+def cmd_find_session(args):
+    """Resuelve una sesion por directorio O por id-de-header, descomprimiendo
+    (nunca grep sobre binarios .zstd, que no puede leerlos)."""
+    sessions_dir = args.sessions
+    ref = args.ref
+    for ws in sorted(os.listdir(sessions_dir)):
+        wsd = os.path.join(sessions_dir, ws)
+        if not os.path.isdir(wsd):
+            continue
+        for d in sorted(os.listdir(wsd)):
+            dpath = os.path.join(wsd, d)
+            if not os.path.isdir(dpath):
+                continue
+            if d == ref:
+                print(dpath)
+                return
+            for name in ("session.jsonl.zstd", "session.jsonl"):
+                art = os.path.join(dpath, name)
+                if not os.path.isfile(art):
+                    continue
+                if art.endswith(".zstd"):
+                    raw = subprocess.run(["zstd", "-dc", art], capture_output=True).stdout.decode("utf-8", errors="replace")
+                else:
+                    with open(art, encoding="utf-8", errors="replace") as f:
+                        raw = f.read()
+                first_line = raw.splitlines()[0] if raw else ""
+                try:
+                    header = json.loads(first_line)
+                except ValueError:
+                    continue
+                if header.get("id") == ref:
+                    print(dpath)
+                    return
+    raise SystemExit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="session-scan.py")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -367,6 +514,29 @@ def main():
     p.add_argument("--snap-dir", required=True)
     p.add_argument("--sessions", required=True)
     p.set_defaults(func=cmd_snapshot)
+    p = sub.add_parser("restore-plan", help="calcula que copiar para un restore (uso interno)")
+    p.add_argument("--snap-dir", required=True)
+    p.add_argument("--sessions", required=True)
+    p.add_argument("--session", default=None, help="limitar a una sesion (id o directory)")
+    p.set_defaults(func=cmd_restore_plan)
+
+    p = sub.add_parser("restore-new-id", help="reescribe el id del header (uso interno)")
+    p.add_argument("--artifact", required=True)
+    p.add_argument("--new-id", required=True)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_restore_new_id)
+
+    p = sub.add_parser("repair", help="marca eventos huerfanos como ignorable (uso interno)")
+    p.add_argument("--artifact", required=True)
+    p.add_argument("--harness", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--types", default=None)
+    p.set_defaults(func=cmd_repair)
+
+    p = sub.add_parser("find-session", help="resuelve una sesion por dir o id (uso interno)")
+    p.add_argument("--sessions", required=True)
+    p.add_argument("--ref", required=True)
+    p.set_defaults(func=cmd_find_session)
     args = parser.parse_args()
     args.func(args)
 

@@ -3,6 +3,41 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/),
 versionado según [SemVer](https://semver.org/lang/es/).
 
+## [1.4.0] - 2026-08-26
+
+### Agregado
+
+- `dsh-manage session-backup restore` — restaura sesiones desde un snapshot,
+  con backup implícito previo (tolera "nada que respaldar"), exige DSH
+  detenido (verificado dos veces), escritura atómica. `--session` limita a
+  una sola sesión, `--to-new-id` restaura como sesión nueva reescribiendo el
+  `id` del header, `--force` es obligatorio para pisar un destino que difiere.
+  El nombre de snapshot pasado a `--from` (incluido `latest`) se resuelve a
+  una ruta absoluta antes de cualquier operación que pueda cambiar a qué
+  apunta `latest`.
+- `dsh-manage session-backup prune` — borra snapshots viejos (`--keep` /
+  `--older-than`), con protección **por sesión individual**: nunca borra la
+  única copia de una sesión `broken`, incluso cuando varios candidatos a
+  borrar comparten esa sesión entre sí.
+- `dsh-manage session-backup repair --mark-ignorable` — marca eventos
+  huérfanos como `ignorable:true` in-place, sin tocar nunca el header.
+  Aborta sin publicar nada si el artefacto de origen tiene una cola rota
+  (evita reescribir un log truncado y perder la cola para siempre). Lossy,
+  nunca en lote (siempre `--session`), copia byte a byte todo lo que no
+  marca, backup implícito previo, y no deja temporales bajo `sessions/` (los
+  temporales viven en `$DSH_BACKUP_ROOT/.repair-scratch/`). Gate de
+  validación superado previamente contra la sesión real de `vpn-monitor-mke`
+  (34789 eventos, 0 rechazados, round-trip lossless).
+- `session_backup_guard()` — gate de resguardo compartido, de solo lectura
+  (contrato 0=sin impacto / 1=error duro / 3=impacto detectado), pensado
+  como base para futuros hooks de `plugins-install`/`plugins-remove`.
+
+### Nota
+
+- `plugins-remove` con gate de resguardo automático y el hook completo de
+  `session_backup_guard` dentro de `plugins-install` (pre-install + post-check)
+  quedan fuera de este release — pendientes para una próxima versión.
+
 ## [1.3.0] - 2026-08-26
 
 ### Actualizado (stack de plugins homologado)
@@ -26,6 +61,10 @@ actualizaciones en el puesto (boot limpio, HTTP 200, peers contra el harness
   (probado en el profile web, boot limpio).
 - `@huanlin/dsh-plugin-better-locale` ^0.1.0 — peer nuevo que exige
   `dsh-better-sidebar` 0.16.1; se instala como dependencia (no como bundle).
+- `dsh-kimicode-swarm` ^0.1.0 — batch de sub-agentes paralelos estilo Kimi
+  (herramienta `swarm_batch` + comando `/swarm` + barra de progreso en vivo).
+  Instalado y verificado en el profile web (boot sin errores). Documentado en
+  `sessionEventWriters` porque escribe el evento `swarm/progress`.
 
 ### Cambiado
 

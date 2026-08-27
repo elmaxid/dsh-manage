@@ -70,7 +70,8 @@ PY
   python3 "$SCAN" baseline --harness "$h" \
       --known "$BATS_TEST_TMPDIR/known.json" \
       > "$BATS_TEST_TMPDIR/out.json" 2>"$BATS_TEST_TMPDIR/err.txt"
-  [ "$?" -eq 0 ]
+  rc=$?
+  [ "$rc" -eq 0 ]
   [[ "$(cat "$BATS_TEST_TMPDIR/out.json")" == *'"changed": true'* ]]
   # B2: el ultimo tipo extraido (tipo/47) es el que se quito del vendorizado;
   # debe aparecer en "added" (demuestra que el script leyo el harness real) y
@@ -100,7 +101,8 @@ PY
   python3 "$SCAN" baseline --harness "$real_harness" \
       --known "$BATS_TEST_DIRNAME/../plugins/known-session-event-types.json" \
       > "$BATS_TEST_TMPDIR/out.json" 2>/dev/null
-  [ "$?" -eq 0 ]
+  rc=$?
+  [ "$rc" -eq 0 ]
   python3 - "$BATS_TEST_TMPDIR/out.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -406,7 +408,487 @@ PY
   run python3 -c "
 import json
 m = json.load(open('$snap/MANIFEST.json'))
-assert m['dshManageVersion'] == '1.2.0', m['dshManageVersion']
+assert m['dshManageVersion'] == '1.4.0', m['dshManageVersion']
 "
   [ "$status" -eq 0 ]
+}
+
+@test "restore exige DSH detenido" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r1--" "session-r1" "session-r1" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r1
+  python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', 39217))
+s.listen(1)
+time.sleep(2)
+" &
+  listener_pid=$!
+  sleep 0.3
+  run env DSH_PORT=39217 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"corriendo"* ]] || [[ "$output" == *"detene"* ]]
+}
+
+@test "restore --from latest restaura el snapshot que existia al invocar, no el backup implicito posterior" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r0--" "session-r0" "session-r0" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-bueno
+  printf 'ESTADO-ROTO' > "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd"
+  run env DSH_PORT=39227 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
+  [ "$status" -eq 0 ]
+  run zstd -t "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+  content="$(zstd -dc "$DSH_HOME/sessions/--ws-r0--/session-r0/session.jsonl.zstd")"
+  [[ "$content" != *"ESTADO-ROTO"* ]]
+  [[ "$content" == *'"type":"tipo/1"'* ]]
+}
+
+@test "restore sin DSH corriendo restaura una sesion desde el snapshot" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r2--" "session-r2" "session-r2" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r2
+  printf 'CORRUPTO' > "$DSH_HOME/sessions/--ws-r2--/session-r2/session.jsonl.zstd"
+  run env DSH_PORT=39218 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
+  [ "$status" -eq 0 ]
+  run zstd -t "$DSH_HOME/sessions/--ws-r2--/session-r2/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+}
+
+@test "restore sin --force no pisa un destino que difiere (por corrupcion, el backup implicito ya aborta antes)" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r3--" "session-r3" "session-r3" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r3
+  printf 'CORRUPTO' > "$DSH_HOME/sessions/--ws-r3--/session-r3/session.jsonl.zstd"
+  run env DSH_PORT=39222 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r3
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--force"* ]]
+  [ "$(cat "$DSH_HOME/sessions/--ws-r3--/session-r3/session.jsonl.zstd")" = "CORRUPTO" ]
+}
+
+@test "restore sin --force no pisa un destino VALIDO que difiere (ejercita el chequeo del loop, no el del backup)" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r7--" "session-r7" "session-r7" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r7
+  # Reescribimos la sesion con un .zstd VALIDO pero de contenido distinto
+  # (agrega un evento) -- a diferencia del test anterior, esto NO corrompe
+  # el artefacto, asi que el backup implicito (que corre verify_dir/zstd -t)
+  # tiene EXITO (rc=0). El flujo debe llegar entonces al chequeo real del
+  # loop (comparacion de sha256 vs --force), que es lo que este test
+  # verifica -- sin esto, un bug que borrara el chequeo del loop pasaria
+  # inadvertido porque el chequeo del backup implicito produce el mismo
+  # mensaje "--force" por una razon distinta.
+  {
+    printf '{"type":"session","version":0,"id":"session-r7","createdAt":1,"cwd":"/tmp/--ws-r7--"}\n'
+    printf '{"type":"tipo/1","seq":1,"time":1,"data":{}}\n'
+    printf '{"type":"tipo/2","seq":2,"time":2,"data":{}}\n'
+  } | zstd -q -f -o "$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd"
+  run zstd -t "$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+  content_antes="$(zstd -dc "$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd")"
+  run env DSH_PORT=39229 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r7
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"'$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd' existe y difiere del snapshot; use --force para pisarlo"* ]]
+  content_despues="$(zstd -dc "$DSH_HOME/sessions/--ws-r7--/session-r7/session.jsonl.zstd")"
+  [ "$content_antes" = "$content_despues" ]
+}
+
+@test "restore --session limita a una sola sesion" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r4--" "session-r4a" "session-r4a" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  fake_session "$DSH_HOME/sessions" "--ws-r4--" "session-r4b" "session-r4b" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r4
+  printf 'CORRUPTO-A' > "$DSH_HOME/sessions/--ws-r4--/session-r4a/session.jsonl.zstd"
+  printf 'CORRUPTO-B' > "$DSH_HOME/sessions/--ws-r4--/session-r4b/session.jsonl.zstd"
+  run env DSH_PORT=39219 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r4a --force
+  [ "$status" -eq 0 ]
+  run zstd -t "$DSH_HOME/sessions/--ws-r4--/session-r4a/session.jsonl.zstd"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$DSH_HOME/sessions/--ws-r4--/session-r4b/session.jsonl.zstd")" = "CORRUPTO-B" ]
+}
+
+@test "restore --to-new-id reescribe el id del header, no solo el directorio" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-r5--" "session-r5" "session-r5" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-r5
+  run env DSH_PORT=39220 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --session session-r5 --to-new-id
+  [ "$status" -eq 0 ]
+  new_dir="$(find "$DSH_HOME/sessions/--ws-r5--" -mindepth 1 -maxdepth 1 -type d ! -name session-r5)"
+  [ -n "$new_dir" ]
+  new_id="$(zstd -dc "$new_dir/session.jsonl.zstd" | head -1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  [ "$new_id" != "session-r5" ]
+  [[ "$new_id" == session-* ]]
+}
+
+@test "restore con sessions vacio no aborta por 'nada que respaldar' del backup implicito" {
+  install_fake_harness 48
+  mkdir -p "$DSH_BACKUP_ROOT"
+  fake_session "$DSH_HOME/sessions" "--ws-r6--" "session-r6" "session-r6" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-con-datos
+  rm -rf "${DSH_HOME:?}/sessions"
+  mkdir -p "$DSH_HOME/sessions"
+  run env DSH_PORT=39223 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup restore --from latest --force
+  [ "$status" -eq 0 ]
+  [ -f "$DSH_HOME/sessions/--ws-r6--/session-r6/session.jsonl.zstd" ]
+}
+
+@test "prune sin --yes no borra nada" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p1--" "session-p1" "session-p1" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label uno
+  sleep 1.1
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label dos
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--yes"* ]]
+  count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' ! -path "$DSH_BACKUP_ROOT" | wc -l)"
+  [ "$count" -eq 2 ]
+}
+
+@test "prune --keep conserva los N mas recientes" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p2--" "session-p2" "session-p2" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label viejo
+  sleep 1.1
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label nuevo
+  viejo_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-viejo)"
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1 --yes
+  [ "$status" -eq 0 ]
+  [ ! -d "$viejo_dir" ]
+  ls -d "$DSH_BACKUP_ROOT"/*-nuevo
+}
+
+@test "prune nunca borra la unica copia de una sesion broken, incluso compartiendo snapshot con otra cubierta" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p3--" "session-S1" "session-S1" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  fake_session "$DSH_HOME/sessions" "--ws-p3--" "session-S2" "session-S2" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-A
+  a_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-snap-A)"
+  sleep 1.1
+  rm -rf "$DSH_HOME/sessions/--ws-p3--/session-S2"
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-B
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 0 --yes
+  [ "$status" -eq 0 ]
+  [ -d "$a_dir" ]
+}
+
+@test "prune borra sin protegerse de mas cuando la sesion SI tiene otra copia" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p4--" "session-S1" "session-S1" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-A
+  a_dir="$(ls -d "$DSH_BACKUP_ROOT"/*-snap-A)"
+  sleep 1.1
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label snap-B
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --keep 1 --yes
+  [ "$status" -eq 0 ]
+  [ ! -d "$a_dir" ]
+}
+
+@test "prune --older-than borra por edad" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-p5--" "session-p5" "session-p5" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label reciente
+  snap="$(ls -d "$DSH_BACKUP_ROOT"/*-reciente)"
+  viejo="$DSH_BACKUP_ROOT/20200101T000000Z-viejo-de-verdad"
+  cp -r "$snap" "$viejo"
+  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup prune --older-than 30 --yes
+  [ "$status" -eq 0 ]
+  [ ! -d "$viejo" ]
+  [ -d "$snap" ]
+}
+
+# --- Task 3: session_backup_guard (gate compartido, read-only) ---
+
+@test "session_backup_guard detecta cuando un paquete a remover deja sesiones broken" {
+  install_fake_harness 48
+  nm="$BATS_TEST_TMPDIR/nm-guard"
+  fake_plugin "$nm" "plugin-guard-test" "guard/evento"
+  fake_session "$DSH_HOME/sessions" "--ws-g1--" "session-g1" "session-g1" \
+    '{"type":"guard/evento","seq":1,"time":1,"data":{}}'
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard remove "$nm/plugin-guard-test" web
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"session-g1"* ]] || [[ "$output" == *"1"* ]]
+}
+
+@test "session_backup_guard no bloquea cuando no hay sesiones afectadas" {
+  install_fake_harness 48
+  nm="$BATS_TEST_TMPDIR/nm-guard2"
+  fake_plugin "$nm" "plugin-sin-uso" "sinuso/evento"
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard remove "$nm/plugin-sin-uso" web
+  [ "$status" -eq 0 ]
+}
+
+@test "session_backup_guard nunca escribe nada (es read-only)" {
+  install_fake_harness 48
+  nm="$BATS_TEST_TMPDIR/nm-guard3"
+  fake_plugin "$nm" "plugin-guard-ro" "guardro/evento"
+  fake_session "$DSH_HOME/sessions" "--ws-g3--" "session-g3" "session-g3" \
+    '{"type":"guardro/evento","seq":1,"time":1,"data":{}}'
+  # El find abajo recorre $DSH_BACKUP_ROOT; creamos el directorio (vacio) para
+  # que find no devuelva 1 y dispare el `set -euo pipefail` que activa
+  # `source --lib`. Solo lectura: se compara TODO (archivos Y directorios,
+  # sin -type f) antes/despues -- un mkdir espurio sin archivos adentro
+  # tambien violaria el contrato read-only y debe detectarse.
+  mkdir -p "$DSH_BACKUP_ROOT"
+  before="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" 2>/dev/null | sort)"
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard remove "$nm/plugin-guard-ro" web
+  [ "$status" -eq 3 ]
+  after="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" 2>/dev/null | sort)"
+  [ "$before" = "$after" ]
+}
+
+# --- Task 6: repair --mark-ignorable ---
+
+@test "repair marca solo tipos desconocidos, preserva byte a byte lo demas Y el header" {
+  install_fake_harness 48
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-rp1--" "session-rp1" "session-rp1" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{"x":  1}}' \
+    '{"type":"foo/desconocido","seq":2,"time":2,"data":{}}' \
+    '{"type":"tipo/2","seq":3,"time":3,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-repair-rp1
+  run env DSH_PORT=39222 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp1 --mark-ignorable --yes
+  [ "$status" -eq 0 ]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '1p'"
+  [[ "$output" != *"ignorable"* ]]
+  [[ "$output" == *'"type":"session"'* ]]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '3p'"
+  [[ "$output" == *'"ignorable": true'* ]]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '2p'"
+  [[ "$output" == *'"x":  1'* ]]
+}
+
+@test "repair aborta sobre un artefacto con cola rota, no publica un archivo parcial" {
+  install_fake_harness 48
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-rp5--" "session-rp5" "session-rp5" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}' \
+    '{"type":"foo/desconocido","seq":2,"time":2,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp5
+  # truncar el .zstd a la mitad para simular una escritura interrumpida
+  artifact="$DSH_HOME/sessions/--ws-rp5--/session-rp5/session.jsonl.zstd"
+  size="$(stat -c%s "$artifact")"
+  head -c $((size / 2)) "$artifact" > "${artifact}.tmp"
+  mv "${artifact}.tmp" "$artifact"
+  original_content="$(xxd "$artifact" | head -1)"
+  run env DSH_PORT=39228 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp5 --mark-ignorable --yes
+  [ "$status" -ne 0 ]
+  # el artefacto truncado no se toco (no se publico un "reparado" parcial)
+  current_content="$(xxd "$artifact" | head -1)"
+  [ "$original_content" = "$current_content" ]
+}
+
+@test "repair exige DSH detenido" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-rp2--" "session-rp2" "session-rp2" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp2
+  python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', 39223))
+s.listen(1)
+time.sleep(2)
+" &
+  listener_pid=$!
+  sleep 0.3
+  run env DSH_PORT=39223 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp2 --mark-ignorable --yes
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+}
+
+@test "repair sin --session falla (nunca en lote)" {
+  install_fake_harness 48
+  run env DSH_PORT=39224 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --mark-ignorable --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--session"* ]]
+}
+
+@test "repair encuentra la sesion por id de header aunque el directorio no coincida" {
+  install_fake_harness 48
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-rp4--" "67890" "session-67890" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp4
+  run env DSH_PORT=39226 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-67890 --mark-ignorable --yes
+  [ "$status" -eq 0 ]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp4--/67890/session.jsonl.zstd' | sed -n '2p'"
+  [[ "$output" == *'"ignorable": true'* ]]
+}
+
+@test "repair hace backup implicito antes de tocar la sesion y no deja temporales bajo sessions/" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-rp3--" "session-rp3" "session-rp3" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp3
+  before_count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' | wc -l)"
+  run env DSH_PORT=39225 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp3 --mark-ignorable --yes
+  [ "$status" -eq 0 ]
+  after_count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' | wc -l)"
+  [ "$after_count" -gt "$before_count" ]
+  # sin restos .repair-plain / .repair-tmp bajo sessions/
+  leftovers="$(find "$DSH_HOME/sessions" -name '*.repair-*' 2>/dev/null | wc -l)"
+  [ "$leftovers" -eq 0 ]
+}
+
+# --- Task 4: plugins_remove con restart mitigado ---
+
+@test "plugins_remove sin --yes y sin TTY aborta sin tocar nada" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/web/node_modules/paquete-inexistente"
+  cat > "$DSH_HOME/profiles/web/package.json" <<'EOF'
+{"name":"web","dependencies":{"paquete-inexistente":"1.0.0"}}
+EOF
+  run env DSH_PORT=39231 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-inexistente web < /dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--yes"* ]] || [[ "$output" == *"TTY"* ]]
+}
+
+@test "plugins_remove con paquete no declarado en package.json falla limpio" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/web"
+  echo '{"name":"web","dependencies":{}}' > "$DSH_HOME/profiles/web/package.json"
+  run env DSH_PORT=39232 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-que-no-existe web --yes
+  [ "$status" -ne 0 ]
+}
+
+@test "guard_rc se captura correctamente bajo set -e (no se pierde con impacto detectado)" {
+  install_fake_harness 48
+  nm="$DSH_HOME/profiles/web/node_modules"
+  mkdir -p "$nm/plugin-con-impacto/lib"
+  cat > "$nm/plugin-con-impacto/package.json" <<'EOF'
+{"name":"plugin-con-impacto","version":"1.0.0"}
+EOF
+  cat > "$nm/plugin-con-impacto/lib/index.js" <<'EOF'
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+export function emit(s) { s.append("impacto/evento", {}); }
+EOF
+  cat > "$DSH_HOME/profiles/web/package.json" <<'EOF'
+{"name":"web","dependencies":{"plugin-con-impacto":"1.0.0"}}
+EOF
+  fake_session "$DSH_HOME/sessions" "--ws-gr--" "session-gr" "session-gr" \
+    '{"type":"impacto/evento","seq":1,"time":1,"data":{}}'
+  # Binario dsh FALSO (variante aprobada por el orquestador): este test usa el
+  # profile "web", cuyo camino post-remocion es restart_dsh(). En un host con
+  # un dsh REAL en :3080 (DSH_PORT default), stop() lo mataria y reiniciaria
+  # produccion. Con puerto libre + este falso que sale 1 sin escuchar nada,
+  # start() no dispara una instalacion real y wait_for_port falla en ~1s: el
+  # restart falla rapido y limpio sin tocar el host. El assertion no depende
+  # del restart: verifica la captura de guard_rc=3 bajo set -e y el backup
+  # automatico, que es lo que esta tarea prueba.
+  cat > "$DSH_NODE/dsh" <<'EOF'
+#!/usr/bin/env bash
+# Binario dsh FALSO para este test: nunca debe escuchar de verdad ni instalar
+# nada. Si algo lo invoca, es indicio de que restart_dsh() intento un start()
+# real -- este test verifica el guard/backup automatico, no un restart real.
+exit 1
+EOF
+  chmod +x "$DSH_NODE/dsh"
+  run env DSH_PORT=39230 DSH_START_TIMEOUT=1 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove plugin-con-impacto web --yes
+  [[ "$output" == *"backup automatico"* ]]
+}
+
+@test "plugins_remove no reinicia dsh.service al tocar un profile que no es web" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/repro/node_modules/paquete-en-repro"
+  cat > "$DSH_HOME/profiles/repro/package.json" <<'EOF'
+{"name":"repro","dependencies":{"paquete-en-repro":"1.0.0"}}
+EOF
+  run env DSH_PORT=39233 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-en-repro repro --yes
+  [[ "$output" == *"no hace falta reiniciar dsh"* ]]
+  [[ "$output" != *"reiniciando dsh"* ]]
+}
+
+# --- Task 5: plugins_install con gate pre-install + post-check ---
+
+@test "plugins_install crea backup pre-install cuando un paquete del manifest es event-writer con sesiones afectadas" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/web"
+  fake_session "$DSH_HOME/sessions" "--ws-pi1--" "session-pi1" "session-pi1" \
+    '{"type":"preinstall/evento","seq":1,"time":1,"data":{}}'
+  nm_fake="$BATS_TEST_TMPDIR/tarball-plugin/lib"
+  mkdir -p "$nm_fake"
+  cat > "$BATS_TEST_TMPDIR/tarball-plugin/package.json" <<'EOF'
+{"name":"plugin-preinstall-test","version":"1.0.0"}
+EOF
+  cat > "$nm_fake/index.js" <<'EOF'
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+export function emit(s) { s.append("preinstall/evento", {}); }
+EOF
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard install "$BATS_TEST_TMPDIR/tarball-plugin" web
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"session-pi1"* ]] || [[ "$output" == *"1"* ]]
+}
+
+@test "plugins_install post-check usa --profile correctamente (no posicional)" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/sessions"
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_scan --profile web --fail-on-risk
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"opcion desconocida"* ]]
+}
+
+@test "plugins_install aborta sin instalar nada si el gate pre-install falla con error duro" {
+  # Deliberadamente SIN install_fake_harness: session_backup_preflight()
+  # falla porque el harness no esta instalado, asi que
+  # session_backup_guard() devuelve rc=1 (error duro) para el primer
+  # paquete del manifest -- plugins_install debe abortar ahi, no
+  # continuar con pnpm install (fail-open seria instalar sin resguardo
+  # cuando el propio chequeo de seguridad esta roto).
+  printf '#!/bin/sh\nexit 0\n' > "$DSH_NODE/dsh"
+  chmod +x "$DSH_NODE/dsh"
+  printf '#!/bin/sh\nexit 0\n' > "$DSH_NODE/pnpm"
+  chmod +x "$DSH_NODE/pnpm"
+  mkdir -p "$DSH_HOME/profiles/web/node_modules/algun-plugin"
+  manifest="$BATS_TEST_TMPDIR/manifest-gate-hard-error.json"
+  cat > "$manifest" <<EOF
+{"dependencies":{"algun-plugin":"1.0.0"},"bundles":[]}
+EOF
+  run bash -c "
+    export DSH_MANIFEST='$manifest'
+    export DSH_PORT=39234
+    export DSH_START_TIMEOUT=1
+    source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && plugins_install web
+  "
+  # rc exacto (no solo != 0): un rc!=0 tardio (ej. el merge o el restart
+  # fallando por otro motivo) tambien satisface "!= 0" sin probar que el
+  # gate abortó DONDE debia. El mensaje exacto + las ausencias explicitas
+  # son lo que realmente distingue "el gate aborto antes de tocar nada" de
+  # "algo fallo despues, tarde, por cualquier otro motivo" (que es
+  # exactamente lo que pasaria si el chequeo guard_rc==1 se reintrodujera
+  # como fail-open: el flujo seguiria hasta pnpm install/restart_dsh y
+  # fallaria mas tarde por otra razon, dando igual un status!=0).
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"el gate de resguardo fallo con un error duro sobre 'algun-plugin'; abortando plugins-install sin instalar nada"* ]]
+  [[ "$output" != *"corriendo pnpm install"* ]]
+  [[ "$output" != *"reiniciando dsh"* ]]
 }

@@ -39,7 +39,7 @@ set -euo pipefail
 # Versión del propio script de gestión (no la de @deepseek-ai/dsh — esa es
 # installed_version/latest_version más abajo). Semver, sin 'v'; el CLI la
 # imprime con 'v' delante. Ver CHANGELOG.md por release.
-DSH_MANAGE_VERSION="1.3.0"
+DSH_MANAGE_VERSION="1.4.0"
 
 DSH_NODE="${DSH_NODE:-$HOME/.local/dsh-node/node24/bin}"
 # Directorio de trabajo/log/pid DE ESTE SCRIPT — NO confundir con DSH_HOME,
@@ -289,6 +289,30 @@ dsh_service_manages_this_home() {
   [ -n "$unit_wd" ] && [ "$unit_wd" = "$DSH_MANAGE_HOME" ]
 }
 
+restart_dsh() {
+  echo "reiniciando dsh para activar los cambios..."
+  if dsh_service_manages_this_home; then
+    systemctl restart dsh.service
+    sleep 3
+  else
+    stop || true
+    sleep 1
+    start
+  fi
+
+  if ! wait_for_port; then
+    echo "dsh no quedó escuchando en :$DSH_PORT tras el restart, ver $DSH_LOG" >&2
+    return 1
+  fi
+
+  echo "boot OK, verificando errores conocidos en el log..."
+  if grep -qiE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG"; then
+    echo "⚠ se encontraron mensajes de error conocidos en $DSH_LOG — revisar antes de dar por bueno" >&2
+    grep -iE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG" | tail -20
+    return 1
+  fi
+}
+
 # Instala el stack de plugins homologado (ver plugins/manifest.json) en un
 # profile de dsh. Separado de install() a propósito: install() solo pone el
 # harness base; esto es una capa aparte, pensada para correrse después (o
@@ -313,6 +337,40 @@ plugins_install() {
   fi
 
   bootstrap_pnpm || return 1
+
+  # Gate de resguardo ANTES de tocar nada -- ni el merge de package.json ni
+  # la copia de patches dependen de este bloque (solo lee $DSH_MANIFEST y
+  # node_modules preexistente), asi que corre primero: "antes de pnpm
+  # install O EL EQUIVALENTE MERGE" del spec se cumple literalmente, no
+  # solo "antes de pnpm install".
+  echo "revisando si el stack a instalar afecta sesiones existentes..."
+  local manifest_pkgs
+  manifest_pkgs="$(node -e "
+    const m = require('$DSH_MANIFEST');
+    console.log(Object.keys(m.dependencies || {}).join('\n'));
+  ")" || { echo "no se pudo leer $DSH_MANIFEST para el gate de resguardo; abortando plugins-install" >&2; return 1; }
+  local pkg any_impact=0
+  for pkg in $manifest_pkgs; do
+    local installed_dir="$profile_dir/node_modules/$pkg"
+    [ -d "$installed_dir" ] || continue
+    local guard_rc=0
+    session_backup_guard install "$installed_dir" "$profile" || guard_rc=$?
+    if [ "$guard_rc" -eq 1 ]; then
+      echo "el gate de resguardo fallo con un error duro sobre '$pkg'; abortando plugins-install sin instalar nada" >&2
+      return 1
+    fi
+    if [ "$guard_rc" -eq 3 ]; then
+      any_impact=1
+    fi
+  done
+  if [ "$any_impact" -eq 1 ]; then
+    echo "creando backup automatico antes de instalar (trigger: plugins-install)..."
+    DSH_TRIGGER="plugins-install" session_backup_create --only-at-risk \
+      --label "preinstall-$(date -u +%Y%m%dT%H%M%SZ)" || {
+      echo "fallo el backup automatico; abortando plugins-install" >&2
+      return 1
+    }
+  fi
 
   echo "instalando stack de plugins homologado en profile '$profile' ($profile_dir)..."
   mkdir -p "$profile_dir/patches"
@@ -359,29 +417,118 @@ plugins_install() {
     (cd "$profile_dir" && PATH="$DSH_NODE:$PATH" pnpm approve-builds $approve_pkgs) || true
   fi
 
-  echo "reiniciando dsh para activar el stack..."
-  if dsh_service_manages_this_home; then
-    systemctl restart dsh.service
-    sleep 3
-  else
-    stop || true
-    sleep 1
-    start
-  fi
+  restart_dsh || return 1
 
-  if ! wait_for_port; then
-    echo "dsh no quedó escuchando en :$DSH_PORT tras instalar los plugins, ver $DSH_LOG" >&2
-    return 1
-  fi
-
-  echo "boot OK, verificando errores conocidos en el log..."
-  if grep -qiE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG"; then
-    echo "⚠ se encontraron mensajes de error conocidos en $DSH_LOG — revisar antes de dar por bueno" >&2
-    grep -iE 'duplicate|failed to load|cannot find package|EADDRINUSE' "$DSH_LOG" | tail -20
-    return 1
+  echo "revisando el impacto del stack instalado sobre las sesiones existentes..."
+  local scan_rc=0
+  session_backup_scan --profile "$profile" --fail-on-risk >/dev/null 2>&1 || scan_rc=$?
+  if [ "$scan_rc" -eq 4 ]; then
+    echo "⚠ hay sesiones 'broken' tras instalar el stack. Corré 'dsh-manage session-backup scan' para el detalle." >&2
+  elif [ "$scan_rc" -eq 3 ]; then
+    echo "ℹ hay sesiones 'at-risk' (dependen de un plugin recién instalado). Considerá 'dsh-manage session-backup create --only-at-risk'." >&2
   fi
 
   echo "listo: profile '$profile' con el stack de plugins activo en :$DSH_PORT"
+}
+
+plugins_remove() {
+  local pkg="${1:-}" profile="${2:-web}"
+  shift 2 2>/dev/null || true
+  local yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) echo "opcion desconocida para plugins-remove: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [ -z "$pkg" ]; then
+    echo "uso: $0 plugins-remove <paquete> [profile] [--yes]" >&2
+    return 1
+  fi
+
+  local profile_dir="$DSH_HOME/profiles/$profile"
+  if [ ! -d "$profile_dir" ]; then
+    echo "profile no encontrado: $profile_dir" >&2
+    return 1
+  fi
+  if [ ! -f "$profile_dir/package.json" ]; then
+    echo "sin package.json en $profile_dir — nada que remover" >&2
+    return 1
+  fi
+  if ! node -e "
+    const pkg = require('$profile_dir/package.json');
+    const has = (pkg.dependencies && pkg.dependencies['$pkg']) ||
+                (pkg.devDependencies && pkg.devDependencies['$pkg']);
+    process.exit(has ? 0 : 1);
+  " 2>/dev/null; then
+    echo "'$pkg' no esta instalado en el profile '$profile'" >&2
+    return 1
+  fi
+
+  local pkg_dir="$profile_dir/node_modules/$pkg"
+  local guard_rc=0
+  if [ -d "$pkg_dir" ]; then
+    session_backup_guard remove "$pkg_dir" "$profile" || guard_rc=$?
+  fi
+
+  if [ "$guard_rc" -eq 1 ]; then
+    echo "el gate de resguardo fallo con un error duro; abortando plugins-remove sin remover nada" >&2
+    return 1
+  fi
+
+  if [ "$guard_rc" -eq 3 ]; then
+    echo "creando backup automatico antes de continuar (trigger: plugins-remove)..."
+    DSH_TRIGGER="plugins-remove" session_backup_create --only-at-risk \
+      --label "preremove-$(printf '%s' "$pkg" | tr -c 'A-Za-z0-9._-' '-')" || {
+      echo "fallo el backup automatico; abortando plugins-remove" >&2
+      return 1
+    }
+    echo
+    echo "opciones tras remover '$pkg':"
+    echo "  a) reinstalar el plugin para volver a leer esas sesiones"
+    echo "  b) dsh-manage session-backup repair --session <id> --mark-ignorable"
+    echo "     (las sesiones cargan, los eventos de ese plugin se omiten)"
+    echo
+    if [ "$yes" -ne 1 ]; then
+      if [ ! -t 0 ]; then
+        echo "sin --yes y sin TTY: abortando sin remover nada" >&2
+        return 1
+      fi
+      read -r -p "¿remover '$pkg' de todas formas? [y/N] " confirm
+      case "$confirm" in
+        y|Y|yes|si|s) : ;;
+        *) echo "cancelado"; return 1 ;;
+      esac
+    fi
+  elif [ "$yes" -ne 1 ] && [ ! -t 0 ]; then
+    echo "sin --yes y sin TTY: abortando sin remover nada" >&2
+    return 1
+  fi
+
+  echo "removiendo '$pkg' del profile '$profile'..."
+  (cd "$profile_dir" && PATH="$DSH_NODE:$PATH" pnpm remove "$pkg") \
+    || { echo "pnpm remove falló, ver arriba" >&2; return 1; }
+
+  # dsh.service (generado por service_install) siempre sirve el profile
+  # "web" (PROFILE_DIR esta fijo en el unit) -- no hay un dsh.service por
+  # profile. Reiniciar produccion por tocar un profile que NO es el
+  # servido (ej. "repro") seria un impacto no consentido en un server
+  # compartido. Solo reiniciamos si el profile tocado es el productivo.
+  if [ "$profile" = "web" ]; then
+    restart_dsh || return 1
+  else
+    echo "profile '$profile' no es 'web' (el que sirve dsh.service) -- no hace falta reiniciar dsh"
+  fi
+
+  echo "verificando el impacto real tras el restart..."
+  local post_rc=0
+  session_backup_scan --profile "$profile" --fail-on-risk >/dev/null 2>&1 || post_rc=$?
+  if [ "$post_rc" -eq 4 ]; then
+    echo "⚠ hay sesiones 'broken' tras remover '$pkg'. Backup disponible con 'dsh-manage session-backup list'." >&2
+  fi
+
+  echo "listo: '$pkg' removido del profile '$profile'"
 }
 
 # Instala el watchdog systemd de dsh: un unit que lo mantiene arriba
@@ -736,6 +883,466 @@ session_backup_verify() {
   echo "OK — $snap integro"
 }
 
+# Chequeo obligatorio antes de restore/repair. Se llama DOS VECES: al inicio
+# (falla rapido) y de nuevo justo antes del mv -T final.
+require_dsh_stopped() {
+  local pid
+  pid="$(port_pid)"
+  if [ -n "$pid" ]; then
+    echo "dsh esta corriendo (pid $pid en :$DSH_PORT). Detenelo primero:" >&2
+    echo "  systemctl stop dsh.service   # si esta gestionado por systemd" >&2
+    echo "  dsh-manage stop               # si no" >&2
+    return 1
+  fi
+}
+
+# Invalida la entrada de una sesion en session_projcache.json. Igualdad
+# EXACTA de id -- este host tiene ids con y sin el prefijo "session-"
+# coexistiendo, y un match por endswith/prefijo puede borrar de mas.
+invalidate_projcache_entry() {
+  local session_id="$1"
+  local cache="$DSH_HOME/storages/session_projcache.json"
+  [ -f "$cache" ] || return 0
+  python3 -c "
+import json, os, sys
+path = sys.argv[1]
+sid = sys.argv[2]
+with open(path, encoding='utf-8') as f:
+    d = json.load(f)
+sessions = d.get('tables', {}).get('sessions', {})
+if sid not in sessions:
+    sys.exit(0)
+del sessions[sid]
+tmp = path + '.tmp'
+old_umask = os.umask(0o077)
+try:
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(d, f)
+finally:
+    os.umask(old_umask)
+os.replace(tmp, path)
+" "$cache" "$session_id"
+}
+
+# restore: copia sesiones desde un snapshot de vuelta a sessions/.
+session_backup_restore() {
+  local from="latest" session="" force=0 to_new_id=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)
+        [ $# -ge 2 ] || { echo "falta el valor de --from" >&2; return 1; }
+        from="$2"; shift 2 ;;
+      --session)
+        [ $# -ge 2 ] || { echo "falta el valor de --session" >&2; return 1; }
+        session="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      --to-new-id) to_new_id=1; shift ;;
+      *) echo "opcion desconocida para restore: $1" >&2; return 1 ;;
+    esac
+  done
+
+  session_backup_preflight || return 1
+  require_dsh_stopped || return 1
+
+  local snap="$DSH_BACKUP_ROOT/$from"
+  [ -e "$snap" ] || { echo "snapshot no encontrado: $snap" >&2; return 1; }
+  # CRITICO: resolver el symlink a una ruta ABSOLUTA REAL ahora, antes de
+  # tocar nada. "latest" es un symlink que session_backup_create() (el
+  # backup implicito de mas abajo) va a re-apuntar al terminar -- si $snap
+  # siguiera siendo la ruta "via latest" en vez de la ruta resuelta, el
+  # resto de esta funcion leeria el backup implicito recien creado en vez
+  # del snapshot original.
+  snap="$(readlink -f "$snap")"
+  [ -d "$snap" ] || { echo "snapshot no encontrado tras resolver: $snap" >&2; return 1; }
+  session_backup_verify_dir "$snap" || { echo "snapshot invalido, abortando restore" >&2; return 1; }
+
+  echo "creando backup del estado actual antes de restaurar..."
+  # rc=0 (respaldo normal) o rc=2 (nada que respaldar) son ambos "seguir".
+  # Cualquier otro rc es un fallo real (preflight, flock, colision de
+  # nombre, o el snapshot no valida por session_backup_verify_dir) -- por
+  # default esto ABORTA, como protege contra fallos genuinos del backup.
+  #
+  # Excepcion, gateada por --force: el propio estado actual puede estar
+  # corrupto (justamente el caso que restore existe para reparar), y en
+  # ese escenario verify_dir hace fallar el backup con rc=1 aunque no haya
+  # ningun problema ajeno. --force ya significa "se lo que hago, segui
+  # adelante" en el resto de esta funcion (pisar un destino que difiere);
+  # aplicamos la misma semantica acá: solo con --force se tolera que el
+  # backup previo no se haya podido completar, y se advierte sin abortar.
+  local backup_rc=0
+  session_backup_create --label "pre-restore-$(date -u +%Y%m%dT%H%M%SZ)" || backup_rc=$?
+  if [ "$backup_rc" -ne 0 ] && [ "$backup_rc" -ne 2 ]; then
+    if [ "$force" -eq 1 ]; then
+      echo "aviso: el backup previo no se completo (rc=$backup_rc). --force esta activo, asi que el restore sigue SIN ninguna copia de resguardo del estado actual -- esto puede deberse a que el estado esta corrupto (esperado si es lo que veniste a reparar) o a otra causa no relacionada (preflight, lock, disco); no hay forma de distinguirlas por el codigo de salida. Si no estabas al tanto de este riesgo, cancela con Ctrl-C." >&2
+    else
+      echo "fallo el backup previo (rc=$backup_rc); abortando restore sin tocar nada. Si el estado actual esta corrupto y es justamente lo que queres reparar, repeti con --force." >&2
+      return 1
+    fi
+  fi
+
+  umask 077
+  local sessions_dir="$DSH_HOME/sessions"
+  local plan_args=("$DSH_MANAGE_DIR/plugins/session-scan.py" restore-plan --snap-dir "$snap" --sessions "$sessions_dir")
+  [ -n "$session" ] && plan_args+=(--session "$session")
+  local plan
+  plan="$(python3 "${plan_args[@]}")" || return 1
+
+  local count=0
+  # "directory" se recibe del python (mismo formato de fila que el resto de
+  # los campos) pero esta funcion no lo necesita -- se descarta a proposito.
+  while IFS=$'\t' read -r src dst _directory sid; do
+    [ -n "$src" ] || continue
+
+    if [ "$to_new_id" -eq 1 ]; then
+      # Esta rama tambien escribe bajo sessions/ (un directorio nuevo, pero
+      # sigue siendo una escritura real) -- misma revalidacion TOCTOU que el
+      # camino normal, justo antes de crear/escribir cualquier cosa.
+      require_dsh_stopped || { echo "dsh arranco durante el restore; abortando antes de crear la nueva sesion" >&2; return 1; }
+
+      local new_dir new_id
+      new_id="session-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+      new_dir="$(cd "$(dirname "$dst")/.." && pwd)/$new_id"
+      mkdir -p "$new_dir"
+      local rewritten
+      rewritten="$new_dir/$(basename "$dst")"
+      local tmp_plain="${rewritten}.plain"
+      python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" restore-new-id \
+        --artifact "$src" --new-id "$new_id" --out "$tmp_plain" || { rm -f "$tmp_plain"; return 1; }
+      if [[ "$rewritten" == *.zstd ]]; then
+        local tmp_final="${rewritten}.restore-tmp"
+        zstd -q -f -o "$tmp_final" "$tmp_plain" || { rm -f "$tmp_plain" "$tmp_final"; return 1; }
+        rm -f "$tmp_plain"
+        mv -T "$tmp_final" "$rewritten"
+      else
+        mv -T "$tmp_plain" "$rewritten"
+      fi
+      count=$((count + 1))
+      continue
+    fi
+
+    if [ -e "$dst" ]; then
+      local cur_sum snap_sum
+      cur_sum="$(sha256sum "$dst" | cut -d' ' -f1)"
+      snap_sum="$(sha256sum "$src" | cut -d' ' -f1)"
+      if [ "$cur_sum" = "$snap_sum" ]; then
+        continue
+      fi
+      if [ "$force" -ne 1 ]; then
+        echo "'$dst' existe y difiere del snapshot; use --force para pisarlo" >&2
+        return 1
+      fi
+    fi
+
+    require_dsh_stopped || { echo "dsh arranco durante el restore; abortando antes de escribir $dst" >&2; return 1; }
+
+    mkdir -p "$(dirname "$dst")"
+    local tmp="${dst}.restore-tmp"
+    cp "$src" "$tmp"
+    mv -T "$tmp" "$dst"
+    invalidate_projcache_entry "$sid" || true
+    count=$((count + 1))
+  done < <(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+for r in d['restores']:
+    print(f\"{r['src']}\t{r['dst']}\t{r['directory']}\t{r['id']}\")
+" "$plan")
+
+  echo "restore completo: $count archivo(s) restaurado(s) desde $snap"
+}
+
+# prune: borra snapshots viejos por retencion. Proteccion POR SESION, no por
+# snapshot: procesa de mas viejo a mas nuevo, considerando "sobrevivientes"
+# a todo lo que no fue decidido a borrar TODAVIA en esta misma pasada.
+session_backup_prune() {
+  local keep=10 older_than="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep)
+        [ $# -ge 2 ] || { echo "falta el valor de --keep" >&2; return 1; }
+        keep="$2"; shift 2 ;;
+      --older-than)
+        [ $# -ge 2 ] || { echo "falta el valor de --older-than" >&2; return 1; }
+        older_than="$2"; shift 2 ;;
+      --yes) yes=1; shift ;;
+      *) echo "opcion desconocida para prune: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [ "$yes" -ne 1 ]; then
+    echo "prune requiere --yes para borrar de verdad" >&2
+    return 1
+  fi
+
+  [ -d "$DSH_BACKUP_ROOT" ] || { echo "no hay snapshots ($DSH_BACKUP_ROOT no existe)"; return 0; }
+
+  local candidates=() dir
+  for dir in "$DSH_BACKUP_ROOT"/*/; do
+    [ -d "$dir" ] || continue
+    case "${dir%/}" in *.partial|*/latest) continue ;; esac
+    [ -f "${dir}MANIFEST.json" ] || continue
+    candidates+=("${dir%/}")
+  done
+  mapfile -t candidates < <(printf '%s\n' "${candidates[@]}" | sort)
+
+  local total=${#candidates[@]}
+  local to_delete=()
+  if [ -n "$older_than" ]; then
+    local cutoff
+    cutoff="$(date -u -d "-${older_than} days" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u -v-"${older_than}"d +%Y%m%dT%H%M%SZ)"
+    for dir in "${candidates[@]}"; do
+      local name; name="$(basename "$dir")"
+      [[ "$name" < "$cutoff" ]] && to_delete+=("$dir")
+    done
+  else
+    if [ "$total" -gt "$keep" ]; then
+      local n_delete=$((total - keep)) i
+      for ((i = 0; i < n_delete; i++)); do
+        to_delete+=("${candidates[$i]}")
+      done
+    fi
+  fi
+
+  local deleted=0 protected=0 final_delete=()
+  for dir in "${to_delete[@]}"; do
+    local cur_survivors=() c
+    for c in "${candidates[@]}"; do
+      [ "$c" = "$dir" ] && continue
+      local already_deleted=0 fd
+      for fd in "${final_delete[@]}"; do [ "$fd" = "$c" ] && already_deleted=1; done
+      [ "$already_deleted" -eq 1 ] && continue
+      cur_survivors+=("$c")
+    done
+
+    local can_delete=1
+    local broken_sids
+    broken_sids="$(python3 -c "
+import json
+try:
+    m = json.load(open('$dir/MANIFEST.json'))
+except Exception:
+    raise SystemExit
+print(' '.join(s['id'] for s in m.get('sessions', []) if s.get('risk') == 'broken'))
+" 2>/dev/null)"
+    if [ -n "$broken_sids" ]; then
+      local sid
+      for sid in $broken_sids; do
+        local covered=0 other
+        for other in "${cur_survivors[@]}"; do
+          if python3 -c "
+import json, sys
+m = json.load(open('$other/MANIFEST.json'))
+sys.exit(0 if any(s['id'] == '$sid' for s in m['sessions']) else 1)
+" 2>/dev/null; then
+            covered=1
+          fi
+        done
+        if [ "$covered" -eq 0 ]; then
+          can_delete=0
+        fi
+      done
+    fi
+
+    if [ "$can_delete" -eq 1 ]; then
+      final_delete+=("$dir")
+      rm -rf -- "$dir"
+      deleted=$((deleted + 1))
+    else
+      protected=$((protected + 1))
+      echo "protegido (unica copia de al menos una sesion broken): $(basename "$dir")"
+    fi
+  done
+
+  echo "prune: $deleted snapshot(s) borrado(s), $protected protegido(s) por ser la unica copia de una sesion broken"
+}
+
+# repair: marca eventos huerfanos como ignorable:true, in-place. Junto con
+# restore, es de las unicas funciones que escriben bajo sessions/. Nunca en
+# lote (siempre --session), backup implicito previo, aborta ante cola rota
+# o si el resultado no preserva lineas/header, y no deja temporales bajo
+# sessions/ (viven en un scratch bajo DSH_BACKUP_ROOT).
+session_backup_repair() {
+  local session="" mark_ignorable=0 types="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session)
+        [ $# -ge 2 ] || { echo "falta el valor de --session" >&2; return 1; }
+        session="$2"; shift 2 ;;
+      --mark-ignorable) mark_ignorable=1; shift ;;
+      --types)
+        [ $# -ge 2 ] || { echo "falta el valor de --types" >&2; return 1; }
+        types="$2"; shift 2 ;;
+      --yes) yes=1; shift ;;
+      *) echo "opcion desconocida para repair: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [ -z "$session" ]; then
+    echo "repair requiere --session (nunca opera en lote por default)" >&2
+    return 1
+  fi
+  if [ "$mark_ignorable" -ne 1 ]; then
+    echo "repair requiere --mark-ignorable (unico modo hoy, explicito)" >&2
+    return 1
+  fi
+  if [ "$yes" -ne 1 ]; then
+    echo "repair requiere --yes: los eventos marcados DEJAN DE INTERPRETARSE (lossy)" >&2
+    return 1
+  fi
+
+  session_backup_preflight || return 1
+  require_dsh_stopped || return 1
+
+  local sessions_dir="$DSH_HOME/sessions"
+  local artifact_dir
+  artifact_dir="$(python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" find-session --sessions "$sessions_dir" --ref "$session")" || {
+    echo "no se encontro la sesion '$session' bajo $sessions_dir" >&2
+    return 1
+  }
+  local artifact_file=""
+  for f in "session.jsonl.zstd" "session.jsonl"; do
+    [ -f "$artifact_dir/$f" ] && artifact_file="$artifact_dir/$f"
+  done
+  [ -n "$artifact_file" ] || { echo "sin artefacto de sesion en $artifact_dir" >&2; return 1; }
+
+  echo "creando backup antes de reparar..."
+  local backup_rc=0
+  session_backup_create --label "pre-repair-$(basename "$session")-$(date -u +%Y%m%dT%H%M%SZ)" || backup_rc=$?
+  if [ "$backup_rc" -ne 0 ] && [ "$backup_rc" -ne 2 ]; then
+    echo "fallo el backup previo (rc=$backup_rc); abortando repair sin tocar nada" >&2
+    return 1
+  fi
+
+  umask 077
+  # Los temporales viven en un scratch bajo DSH_BACKUP_ROOT, NUNCA bajo
+  # sessions/ (invariante S5.1). Mismo filesystem que sessions/ (confirmado
+  # mismo device id), asi que el mv -T final sigue siendo atomico.
+  local scratch="$DSH_BACKUP_ROOT/.repair-scratch"
+  mkdir -p "$scratch"
+  local work_id
+  work_id="$(basename "$artifact_file")-$$-$(date -u +%s)"
+  local out_plain="$scratch/${work_id}.plain"
+  local repair_args=(
+    "$DSH_MANAGE_DIR/plugins/session-scan.py" repair
+    --artifact "$artifact_file"
+    --harness "$(dsh_session_lib_path)"
+    --out "$out_plain"
+  )
+  [ -n "$types" ] && repair_args+=(--types "$types")
+  local repair_output
+  repair_output="$(python3 "${repair_args[@]}")" || { rm -f "$out_plain"; return 1; }
+  echo "$repair_output"
+
+  local new_artifact="$scratch/${work_id}.repaired"
+  if [[ "$artifact_file" == *.zstd ]]; then
+    zstd -q -f -o "$new_artifact" "$out_plain" || { rm -f "$out_plain" "$new_artifact"; return 1; }
+  else
+    cp "$out_plain" "$new_artifact"
+  fi
+  rm -f "$out_plain"
+
+  local orig_lines new_lines orig_header new_header
+  if [[ "$artifact_file" == *.zstd ]]; then
+    zstd -t "$new_artifact" >/dev/null 2>&1 || { echo "el archivo reparado no valida (zstd -t), abortando" >&2; rm -f "$new_artifact"; return 1; }
+    orig_lines="$(zstd -dc "$artifact_file" | wc -l)"
+    new_lines="$(zstd -dc "$new_artifact" | wc -l)"
+    orig_header="$(zstd -dc "$artifact_file" | head -1)"
+    new_header="$(zstd -dc "$new_artifact" | head -1)"
+  else
+    orig_lines="$(wc -l < "$artifact_file")"
+    new_lines="$(wc -l < "$new_artifact")"
+    orig_header="$(head -1 "$artifact_file")"
+    new_header="$(head -1 "$new_artifact")"
+  fi
+  if [ "$orig_lines" != "$new_lines" ] || [ "$orig_header" != "$new_header" ]; then
+    echo "el archivo reparado no preserva lineas/header original, abortando" >&2
+    rm -f "$new_artifact"
+    return 1
+  fi
+
+  require_dsh_stopped || { echo "dsh arranco durante el repair; abortando antes de publicar" >&2; rm -f "$new_artifact"; return 1; }
+
+  mv -T "$new_artifact" "$artifact_file"
+  invalidate_projcache_entry "$session" || true
+  rmdir "$scratch" 2>/dev/null || true
+
+  echo "repair completo sobre $artifact_file"
+}
+
+# Gate compartido, READ-ONLY. Contrato: 0=sin impacto, 1=error duro,
+# 3=impacto detectado (el LLAMADOR decide backup+confirmacion).
+session_backup_guard() {
+  local accion="$1" pkg_dir="$2" profile="$3"
+  session_backup_preflight || return 1
+
+  local sessions_dir="$DSH_HOME/sessions"
+  [ -d "$sessions_dir" ] || return 0
+
+  local pkg_types
+  pkg_types="$(python3 - "$pkg_dir" <<'PY'
+import sys, os, re
+APPEND_LITERAL = re.compile(r'append\(\s*"([a-z][a-z0-9-]*/[a-z0-9/-]+)"')
+VOCAB_MARKER = "KNOWN_SESSION_EVENT_TYPES"
+pkg_dir = sys.argv[1]
+lib = os.path.join(pkg_dir, "lib")
+types = set()
+if os.path.isdir(lib):
+    for root, _, files in os.walk(lib):
+        for name in files:
+            if not name.endswith(".js"):
+                continue
+            try:
+                with open(os.path.join(root, name), encoding="utf-8", errors="replace") as f:
+                    src = f.read()
+            except OSError:
+                continue
+            if VOCAB_MARKER not in src:
+                continue
+            types.update(APPEND_LITERAL.findall(src))
+print("\n".join(sorted(types)))
+PY
+)" || return 1
+
+  if [ -z "$pkg_types" ]; then
+    return 0
+  fi
+
+  local scan_args=(
+    "$DSH_MANAGE_DIR/plugins/session-scan.py" scan
+    --sessions "$sessions_dir"
+    --harness "$(dsh_session_lib_path)"
+  )
+  local profile_nm="$DSH_HOME/profiles/$profile/node_modules"
+  [ -d "$profile_nm" ] && scan_args+=(--profile-node-modules "$profile_nm")
+  local scan_json
+  scan_json="$(python3 "${scan_args[@]}")" || return 1
+
+  local affected
+  affected="$(python3 -c "
+import json, sys
+scan = json.loads(sys.argv[1])
+pkg_types = set(sys.argv[2].splitlines())
+hits = []
+for s in scan['sessions']:
+    types_here = {u['type'] for u in s.get('unknownTypes', [])}
+    if types_here & pkg_types:
+        hits.append(s['id'])
+print(len(hits))
+for h in hits:
+    print(h)
+" "$scan_json" "$pkg_types")" || return 1
+
+  local n_affected
+  n_affected="$(echo "$affected" | head -1)"
+  if [ "$n_affected" -eq 0 ] 2>/dev/null; then
+    return 0
+  fi
+
+  echo "⚠ esta operacion ($accion) afecta a $n_affected sesion(es):"
+  echo "$affected" | tail -n +2 | sed 's/^/    /'
+  return 3
+}
+
 # Despachador de los subcomandos de session-backup.
 session_backup() {
   local sub="${1:-}"
@@ -745,7 +1352,10 @@ session_backup() {
     create)   session_backup_create "$@" ;;
     list)     session_backup_list "$@" ;;
     verify)   session_backup_verify "$@" ;;
-    *) echo "uso: $0 session-backup {scan|create|list|verify}"; return 1 ;;
+    restore)  session_backup_restore "$@" ;;
+    prune)    session_backup_prune "$@" ;;
+    repair)   session_backup_repair "$@" ;;
+    *) echo "uso: $0 session-backup {scan|create|list|verify|restore|prune|repair}"; return 1 ;;
   esac
 }
 
@@ -865,10 +1475,11 @@ case "${1:-}" in
   status)           status ;;
   install)          install ;;
   plugins-install)  plugins_install "${2:-}" ;;
+  plugins-remove)   plugins_remove "${2:-}" "${3:-web}" "${@:4}" ;;
   service-install)  service_install ;;
   session-backup)   session_backup "${@:2}" ;;
   version)          version ;;
   check-update)     check_update ;;
   --version|-V)     echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
-  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify}|version|check-update}"; exit 1 ;;
+  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|plugins-remove <paquete> [profile] [--yes]|service-install|session-backup {scan|create|list|verify|restore|prune|repair}|version|check-update}"; exit 1 ;;
 esac
