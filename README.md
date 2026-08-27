@@ -13,7 +13,8 @@ instalación de DSH aislada en la tree de `node24` del usuario.
 | Comando                      | Qué hace                                                                 |
 |------------------------------|--------------------------------------------------------------------------|
 | `install`                    | Instala `@deepseek-ai/dsh` globalmente en la tree de `node24`            |
-| `plugins-install [profile]`  | Instala el stack de plugins homologado (dev/seguridad/ops) en un profile — default `web` |
+| `plugins-install [profile]`  | Instala el stack de plugins homologado (dev/seguridad/ops) en un profile — default `web`; corre el gate de resguardo antes de instalar |
+| `plugins-remove <paquete> [profile] [--yes]` | Remueve un paquete con el gate de resguardo obligatorio (backup automático si detecta impacto, confirmación explícita) |
 | `service-install`            | Instala el watchdog systemd (`dsh.service`, `Restart=always`) — requiere root |
 | `session-backup {scan,create,list,verify,restore,prune,repair}` | Resguardo de sesiones: clasifica riesgo, crea/restaura snapshots verificables, poda por retención y repara sesiones con eventos huérfanos |
 | `start`                      | Arranca el servidor web si no está escuchando ya (idempotente)           |
@@ -211,6 +212,25 @@ forma atómica (temporal + `mv -T`).
 > primero** (`systemctl stop dsh.service`). El proceso vivo mantiene un
 > descriptor abierto en modo append: reemplazar el archivo por debajo hace
 > que la restauración se pierda en silencio.
+
+### `plugins-remove`: quitar un plugin sin romper sesiones a ciegas
+
+```bash
+dsh-manage plugins-remove <paquete> [profile] [--yes]
+```
+
+Antes de correr `pnpm remove`, corre el mismo gate de resguardo que usa
+`plugins-install` (de solo lectura): si el paquete a remover escribe eventos
+de sesión que alguna sesión existente usa, crea un backup automático
+(`session-backup create --only-at-risk`, trigger `plugins-remove`) y exige
+confirmación explícita — aborta sin tocar nada si no se pasó `--yes` y no hay
+TTY. Sin impacto detectado, remueve directo.
+
+Solo reinicia `dsh.service` si el profile tocado es `web` (el único que el
+servicio real sirve) — remover de un profile de prueba nunca reinicia
+producción. Esta es la funcionalidad cuya ausencia causó el incidente
+original que motivó todo `session-backup`: un plugin desinstalado sin aviso
+rompió sesiones reales.
 
 ## Requisitos
 
