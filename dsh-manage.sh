@@ -363,6 +363,31 @@ plugins_install() {
     fi
   done
 
+  echo "revisando si el stack a instalar afecta sesiones existentes..."
+  local manifest_pkgs
+  manifest_pkgs="$(node -e "
+    const m = require('$DSH_MANIFEST');
+    console.log(Object.keys(m.dependencies || {}).join('\n'));
+  " 2>/dev/null)"
+  local pkg any_impact=0
+  for pkg in $manifest_pkgs; do
+    local installed_dir="$profile_dir/node_modules/$pkg"
+    [ -d "$installed_dir" ] || continue
+    local guard_rc=0
+    session_backup_guard install "$installed_dir" "$profile" || guard_rc=$?
+    if [ "$guard_rc" -eq 3 ]; then
+      any_impact=1
+    fi
+  done
+  if [ "$any_impact" -eq 1 ]; then
+    echo "creando backup automatico antes de instalar (trigger: plugins-install)..."
+    DSH_TRIGGER="plugins-install" session_backup_create --only-at-risk \
+      --label "preinstall-$(date -u +%Y%m%dT%H%M%SZ)" || {
+      echo "fallo el backup automatico; abortando plugins-install" >&2
+      return 1
+    }
+  fi
+
   echo "corriendo pnpm install..."
   # pnpm (a diferencia de npm) no tiene un flag --allow-scripts: los builds
   # nativos se controlan vía pnpm-workspace.yaml (allowBuilds/strictDepBuilds,
@@ -384,6 +409,15 @@ plugins_install() {
   fi
 
   restart_dsh || return 1
+
+  echo "revisando el impacto del stack instalado sobre las sesiones existentes..."
+  local scan_rc=0
+  session_backup_scan --profile "$profile" --fail-on-risk >/dev/null 2>&1 || scan_rc=$?
+  if [ "$scan_rc" -eq 4 ]; then
+    echo "⚠ hay sesiones 'broken' tras instalar el stack. Corré 'dsh-manage session-backup scan' para el detalle." >&2
+  elif [ "$scan_rc" -eq 3 ]; then
+    echo "ℹ hay sesiones 'at-risk' (dependen de un plugin recién instalado). Considerá 'dsh-manage session-backup create --only-at-risk'." >&2
+  fi
 
   echo "listo: profile '$profile' con el stack de plugins activo en :$DSH_PORT"
 }

@@ -823,3 +823,36 @@ EOF
   [[ "$output" == *"no hace falta reiniciar dsh"* ]]
   [[ "$output" != *"reiniciando dsh"* ]]
 }
+
+# --- Task 5: plugins_install con gate pre-install + post-check ---
+
+@test "plugins_install crea backup pre-install cuando un paquete del manifest es event-writer con sesiones afectadas" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/profiles/web"
+  fake_session "$DSH_HOME/sessions" "--ws-pi1--" "session-pi1" "session-pi1" \
+    '{"type":"preinstall/evento","seq":1,"time":1,"data":{}}'
+  nm_fake="$BATS_TEST_TMPDIR/tarball-plugin/lib"
+  mkdir -p "$nm_fake"
+  cat > "$BATS_TEST_TMPDIR/tarball-plugin/package.json" <<'EOF'
+{"name":"plugin-preinstall-test","version":"1.0.0"}
+EOF
+  cat > "$nm_fake/index.js" <<'EOF'
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
+export function emit(s) { s.append("preinstall/evento", {}); }
+EOF
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_guard install "$BATS_TEST_TMPDIR/tarball-plugin" web
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"session-pi1"* ]] || [[ "$output" == *"1"* ]]
+}
+
+@test "plugins_install post-check usa --profile correctamente (no posicional)" {
+  install_fake_harness 48
+  mkdir -p "$DSH_HOME/sessions"
+  # shellcheck disable=SC1091  # source --lib por tests, fuera del flujo de dispatch
+  source "$BATS_TEST_DIRNAME/../dsh-manage.sh" --lib
+  run session_backup_scan --profile web --fail-on-risk
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"opcion desconocida"* ]]
+}
