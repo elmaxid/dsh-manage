@@ -15,7 +15,7 @@ instalación de DSH aislada en la tree de `node24` del usuario.
 | `install`                    | Instala `@deepseek-ai/dsh` globalmente en la tree de `node24`            |
 | `plugins-install [profile]`  | Instala el stack de plugins homologado (dev/seguridad/ops) en un profile — default `web` |
 | `service-install`            | Instala el watchdog systemd (`dsh.service`, `Restart=always`) — requiere root |
-| `session-backup {scan,create,list,verify}` | Resguardo de sesiones: clasifica riesgo y crea snapshots verificables |
+| `session-backup {scan,create,list,verify,restore,prune,repair}` | Resguardo de sesiones: clasifica riesgo, crea/restaura snapshots verificables, poda por retención y repara sesiones con eventos huérfanos |
 | `start`                      | Arranca el servidor web si no está escuchando ya (idempotente)           |
 | `stop`                       | Detiene el proceso que escucha el puerto                                  |
 | `update`                     | `uninstall` + `install` limpio de la última versión y lo deja corriendo   |
@@ -161,6 +161,9 @@ dsh-manage session-backup scan       # ¿qué sesiones están en riesgo?
 dsh-manage session-backup create --only-at-risk --label pre-cambios
 dsh-manage session-backup list
 dsh-manage session-backup verify --from latest
+dsh-manage session-backup restore --from latest --session <id>   # requiere DSH detenido
+dsh-manage session-backup prune --keep 10 --yes                   # nunca borra la unica copia de una sesion broken
+dsh-manage session-backup repair --session <id> --mark-ignorable --yes  # requiere DSH detenido
 ```
 
 | Clase | Significado |
@@ -174,17 +177,40 @@ snapshots viven en `$DSH_HOME/session-backups/` (hermano de `sessions/`), con
 `MANIFEST.json`, `CHECKSUMS.sha256` y `vocabulary.json` — verificables con
 `sha256sum -c` sin necesitar este script.
 
-> ⚠️ **Esto da visibilidad y copias, no inmunidad.** Nada impide todavía un
-> `plugin remove` que rompa sesiones (eso es la Fase 4 del diseño), y los eventos
-> ya escritos siguen sin marcar porque **el harness `0.1.1-rc.2` descarta el flag
-> `ignorable`** — no es algo que se arregle desde un plugin. Hasta que salga una
-> release del harness que lo propague, la recuperación de una sesión rota es:
-> reinstalar el plugin que declaraba esos tipos.
+**`restore` y `repair` son las únicas dos operaciones que escriben bajo
+`sessions/`.** Ambas exigen DSH detenido (verificado dos veces: al inicio y
+justo antes de publicar), hacen un backup implícito previo, y escriben de
+forma atómica (temporal + `mv -T`).
 
-> ⚠️ **Si restaurás un log a mano con `cp`, detené DSH primero**
-> (`systemctl stop dsh.service`). El proceso vivo mantiene un descriptor abierto
-> en modo append: reemplazar el archivo por debajo hace que la restauración se
-> pierda en silencio.
+- `restore --from <snapshot> [--session <id>] [--force] [--to-new-id]`
+  restaura uno o todos los artefactos de un snapshot. `--force` es
+  obligatorio para pisar un destino que ya existe y difiere. `--to-new-id`
+  restaura como sesión nueva, reescribiendo el `id` del header.
+- `prune --keep N | --older-than DIAS --yes` borra snapshots viejos, con
+  protección **por sesión individual**: nunca borra la única copia de una
+  sesión `broken`, aunque otro snapshot candidato a borrar comparta esa
+  sesión.
+- `repair --session <id> --mark-ignorable --yes [--types t1,t2]` marca
+  eventos huérfanos como `ignorable:true` **in-place**, sin tocar nunca el
+  header. Requiere `--session` siempre (nunca opera en lote). Aborta sin
+  publicar nada si el artefacto de origen tiene una cola rota (una escritura
+  interrumpida) — reparar reescribe el archivo completo, así que publicar
+  solo el fragmento recuperable sería perder la cola para siempre sin aviso.
+
+> ⚠️ **`repair` es la vía de recuperación sin reinstalar el plugin.** El flag
+> `ignorable:true` que `repair` escribe directo en el JSONL (in-place, sin
+> pasar por `Session.append()`) sí es respetado por la ruta de *lectura* del
+> harness al abrir la sesión — verificado contra `KNOWN_SESSION_EVENT_TYPES`
+> y `decodeStorageRecord` reales del harness `0.1.1-rc.2` instalado, sin
+> falsos positivos por filas de chunk sin expandir. Lo único que el harness
+> `0.1.1-rc.2` descarta es el flag `ignorable` pasado a `Session.append()`
+> **en vivo** (mientras el plugin sigue corriendo) — eso no afecta a `repair`,
+> que nunca llama a `append()`.
+
+> ⚠️ **Si restaurás un log a mano con `cp` (fuera de `restore`), detené DSH
+> primero** (`systemctl stop dsh.service`). El proceso vivo mantiene un
+> descriptor abierto en modo append: reemplazar el archivo por debajo hace
+> que la restauración se pierda en silencio.
 
 ## Requisitos
 

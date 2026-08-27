@@ -408,7 +408,7 @@ PY
   run python3 -c "
 import json
 m = json.load(open('$snap/MANIFEST.json'))
-assert m['dshManageVersion'] == '1.2.0', m['dshManageVersion']
+assert m['dshManageVersion'] == '1.4.0', m['dshManageVersion']
 "
   [ "$status" -eq 0 ]
 }
@@ -659,4 +659,99 @@ time.sleep(2)
   [ "$status" -eq 3 ]
   after="$(find "$DSH_HOME/sessions" "$DSH_BACKUP_ROOT" 2>/dev/null | sort)"
   [ "$before" = "$after" ]
+}
+
+# --- Task 6: repair --mark-ignorable ---
+
+@test "repair marca solo tipos desconocidos, preserva byte a byte lo demas Y el header" {
+  install_fake_harness 48
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-rp1--" "session-rp1" "session-rp1" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{"x":  1}}' \
+    '{"type":"foo/desconocido","seq":2,"time":2,"data":{}}' \
+    '{"type":"tipo/2","seq":3,"time":3,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-repair-rp1
+  run env DSH_PORT=39222 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp1 --mark-ignorable --yes
+  [ "$status" -eq 0 ]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '1p'"
+  [[ "$output" != *"ignorable"* ]]
+  [[ "$output" == *'"type":"session"'* ]]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '3p'"
+  [[ "$output" == *'"ignorable": true'* ]]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp1--/session-rp1/session.jsonl.zstd' | sed -n '2p'"
+  [[ "$output" == *'"x":  1'* ]]
+}
+
+@test "repair aborta sobre un artefacto con cola rota, no publica un archivo parcial" {
+  install_fake_harness 48
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-rp5--" "session-rp5" "session-rp5" \
+    '{"type":"tipo/1","seq":1,"time":1,"data":{}}' \
+    '{"type":"foo/desconocido","seq":2,"time":2,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp5
+  # truncar el .zstd a la mitad para simular una escritura interrumpida
+  artifact="$DSH_HOME/sessions/--ws-rp5--/session-rp5/session.jsonl.zstd"
+  size="$(stat -c%s "$artifact")"
+  head -c $((size / 2)) "$artifact" > "${artifact}.tmp"
+  mv "${artifact}.tmp" "$artifact"
+  original_content="$(xxd "$artifact" | head -1)"
+  run env DSH_PORT=39228 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp5 --mark-ignorable --yes
+  [ "$status" -ne 0 ]
+  # el artefacto truncado no se toco (no se publico un "reparado" parcial)
+  current_content="$(xxd "$artifact" | head -1)"
+  [ "$original_content" = "$current_content" ]
+}
+
+@test "repair exige DSH detenido" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-rp2--" "session-rp2" "session-rp2" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp2
+  python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', 39223))
+s.listen(1)
+time.sleep(2)
+" &
+  listener_pid=$!
+  sleep 0.3
+  run env DSH_PORT=39223 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp2 --mark-ignorable --yes
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
+  [ "$status" -ne 0 ]
+}
+
+@test "repair sin --session falla (nunca en lote)" {
+  install_fake_harness 48
+  run env DSH_PORT=39224 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --mark-ignorable --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--session"* ]]
+}
+
+@test "repair encuentra la sesion por id de header aunque el directorio no coincida" {
+  install_fake_harness 48
+  h="$(install_fake_harness 48)"
+  fake_session "$DSH_HOME/sessions" "--ws-rp4--" "67890" "session-67890" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp4
+  run env DSH_PORT=39226 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-67890 --mark-ignorable --yes
+  [ "$status" -eq 0 ]
+  run bash -c "zstd -dc '$DSH_HOME/sessions/--ws-rp4--/67890/session.jsonl.zstd' | sed -n '2p'"
+  [[ "$output" == *'"ignorable": true'* ]]
+}
+
+@test "repair hace backup implicito antes de tocar la sesion y no deja temporales bajo sessions/" {
+  install_fake_harness 48
+  fake_session "$DSH_HOME/sessions" "--ws-rp3--" "session-rp3" "session-rp3" \
+    '{"type":"foo/x","seq":1,"time":1,"data":{}}'
+  bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup create --label pre-rp3
+  before_count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' | wc -l)"
+  run env DSH_PORT=39225 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" session-backup repair --session session-rp3 --mark-ignorable --yes
+  [ "$status" -eq 0 ]
+  after_count="$(find "$DSH_BACKUP_ROOT" -maxdepth 1 -type d ! -name '*.partial' | wc -l)"
+  [ "$after_count" -gt "$before_count" ]
+  # sin restos .repair-plain / .repair-tmp bajo sessions/
+  leftovers="$(find "$DSH_HOME/sessions" -name '*.repair-*' 2>/dev/null | wc -l)"
+  [ "$leftovers" -eq 0 ]
 }

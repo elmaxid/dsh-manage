@@ -39,7 +39,7 @@ set -euo pipefail
 # Versión del propio script de gestión (no la de @deepseek-ai/dsh — esa es
 # installed_version/latest_version más abajo). Semver, sin 'v'; el CLI la
 # imprime con 'v' delante. Ver CHANGELOG.md por release.
-DSH_MANAGE_VERSION="1.3.0"
+DSH_MANAGE_VERSION="1.4.0"
 
 DSH_NODE="${DSH_NODE:-$HOME/.local/dsh-node/node24/bin}"
 # Directorio de trabajo/log/pid DE ESTE SCRIPT — NO confundir con DSH_HOME,
@@ -1009,6 +1009,119 @@ sys.exit(0 if any(s['id'] == '$sid' for s in m['sessions']) else 1)
   echo "prune: $deleted snapshot(s) borrado(s), $protected protegido(s) por ser la unica copia de una sesion broken"
 }
 
+# repair: marca eventos huerfanos como ignorable:true, in-place. Junto con
+# restore, es de las unicas funciones que escriben bajo sessions/. Nunca en
+# lote (siempre --session), backup implicito previo, aborta ante cola rota
+# o si el resultado no preserva lineas/header, y no deja temporales bajo
+# sessions/ (viven en un scratch bajo DSH_BACKUP_ROOT).
+session_backup_repair() {
+  local session="" mark_ignorable=0 types="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session)
+        [ $# -ge 2 ] || { echo "falta el valor de --session" >&2; return 1; }
+        session="$2"; shift 2 ;;
+      --mark-ignorable) mark_ignorable=1; shift ;;
+      --types)
+        [ $# -ge 2 ] || { echo "falta el valor de --types" >&2; return 1; }
+        types="$2"; shift 2 ;;
+      --yes) yes=1; shift ;;
+      *) echo "opcion desconocida para repair: $1" >&2; return 1 ;;
+    esac
+  done
+
+  if [ -z "$session" ]; then
+    echo "repair requiere --session (nunca opera en lote por default)" >&2
+    return 1
+  fi
+  if [ "$mark_ignorable" -ne 1 ]; then
+    echo "repair requiere --mark-ignorable (unico modo hoy, explicito)" >&2
+    return 1
+  fi
+  if [ "$yes" -ne 1 ]; then
+    echo "repair requiere --yes: los eventos marcados DEJAN DE INTERPRETARSE (lossy)" >&2
+    return 1
+  fi
+
+  session_backup_preflight || return 1
+  require_dsh_stopped || return 1
+
+  local sessions_dir="$DSH_HOME/sessions"
+  local artifact_dir
+  artifact_dir="$(python3 "$DSH_MANAGE_DIR/plugins/session-scan.py" find-session --sessions "$sessions_dir" --ref "$session")" || {
+    echo "no se encontro la sesion '$session' bajo $sessions_dir" >&2
+    return 1
+  }
+  local artifact_file=""
+  for f in "session.jsonl.zstd" "session.jsonl"; do
+    [ -f "$artifact_dir/$f" ] && artifact_file="$artifact_dir/$f"
+  done
+  [ -n "$artifact_file" ] || { echo "sin artefacto de sesion en $artifact_dir" >&2; return 1; }
+
+  echo "creando backup antes de reparar..."
+  local backup_rc=0
+  session_backup_create --label "pre-repair-$(basename "$session")-$(date -u +%Y%m%dT%H%M%SZ)" || backup_rc=$?
+  if [ "$backup_rc" -ne 0 ] && [ "$backup_rc" -ne 2 ]; then
+    echo "fallo el backup previo (rc=$backup_rc); abortando repair sin tocar nada" >&2
+    return 1
+  fi
+
+  umask 077
+  # Los temporales viven en un scratch bajo DSH_BACKUP_ROOT, NUNCA bajo
+  # sessions/ (invariante S5.1). Mismo filesystem que sessions/ (confirmado
+  # mismo device id), asi que el mv -T final sigue siendo atomico.
+  local scratch="$DSH_BACKUP_ROOT/.repair-scratch"
+  mkdir -p "$scratch"
+  local work_id
+  work_id="$(basename "$artifact_file")-$$-$(date -u +%s)"
+  local out_plain="$scratch/${work_id}.plain"
+  local repair_args=(
+    "$DSH_MANAGE_DIR/plugins/session-scan.py" repair
+    --artifact "$artifact_file"
+    --harness "$(dsh_session_lib_path)"
+    --out "$out_plain"
+  )
+  [ -n "$types" ] && repair_args+=(--types "$types")
+  local repair_output
+  repair_output="$(python3 "${repair_args[@]}")" || { rm -f "$out_plain"; return 1; }
+  echo "$repair_output"
+
+  local new_artifact="$scratch/${work_id}.repaired"
+  if [[ "$artifact_file" == *.zstd ]]; then
+    zstd -q -f -o "$new_artifact" "$out_plain" || { rm -f "$out_plain" "$new_artifact"; return 1; }
+  else
+    cp "$out_plain" "$new_artifact"
+  fi
+  rm -f "$out_plain"
+
+  local orig_lines new_lines orig_header new_header
+  if [[ "$artifact_file" == *.zstd ]]; then
+    zstd -t "$new_artifact" >/dev/null 2>&1 || { echo "el archivo reparado no valida (zstd -t), abortando" >&2; rm -f "$new_artifact"; return 1; }
+    orig_lines="$(zstd -dc "$artifact_file" | wc -l)"
+    new_lines="$(zstd -dc "$new_artifact" | wc -l)"
+    orig_header="$(zstd -dc "$artifact_file" | head -1)"
+    new_header="$(zstd -dc "$new_artifact" | head -1)"
+  else
+    orig_lines="$(wc -l < "$artifact_file")"
+    new_lines="$(wc -l < "$new_artifact")"
+    orig_header="$(head -1 "$artifact_file")"
+    new_header="$(head -1 "$new_artifact")"
+  fi
+  if [ "$orig_lines" != "$new_lines" ] || [ "$orig_header" != "$new_header" ]; then
+    echo "el archivo reparado no preserva lineas/header original, abortando" >&2
+    rm -f "$new_artifact"
+    return 1
+  fi
+
+  require_dsh_stopped || { echo "dsh arranco durante el repair; abortando antes de publicar" >&2; rm -f "$new_artifact"; return 1; }
+
+  mv -T "$new_artifact" "$artifact_file"
+  invalidate_projcache_entry "$session" || true
+  rmdir "$scratch" 2>/dev/null || true
+
+  echo "repair completo sobre $artifact_file"
+}
+
 # Gate compartido, READ-ONLY. Contrato: 0=sin impacto, 1=error duro,
 # 3=impacto detectado (el LLAMADOR decide backup+confirmacion).
 session_backup_guard() {
@@ -1094,7 +1207,8 @@ session_backup() {
     verify)   session_backup_verify "$@" ;;
     restore)  session_backup_restore "$@" ;;
     prune)    session_backup_prune "$@" ;;
-    *) echo "uso: $0 session-backup {scan|create|list|verify|restore|prune}"; return 1 ;;
+    repair)   session_backup_repair "$@" ;;
+    *) echo "uso: $0 session-backup {scan|create|list|verify|restore|prune|repair}"; return 1 ;;
   esac
 }
 
@@ -1219,5 +1333,5 @@ case "${1:-}" in
   version)          version ;;
   check-update)     check_update ;;
   --version|-V)     echo "dsh-manage v$DSH_MANAGE_VERSION" ;;
-  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify|restore|prune}|version|check-update}"; exit 1 ;;
+  *) echo "uso: $0 {start|stop|update|status|install|plugins-install [profile]|service-install|session-backup {scan|create|list|verify|restore|prune|repair}|version|check-update}"; exit 1 ;;
 esac
