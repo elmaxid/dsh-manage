@@ -338,31 +338,11 @@ plugins_install() {
 
   bootstrap_pnpm || return 1
 
-  echo "instalando stack de plugins homologado en profile '$profile' ($profile_dir)..."
-  mkdir -p "$profile_dir/patches"
-
-  local existing_pkg="$profile_dir/package.json"
-  local existing_ws="$profile_dir/pnpm-workspace.yaml"
-  local merged_pkg merged_ws
-  merged_pkg="$(node "$DSH_MANAGE_DIR/plugins/merge-package-json.mjs" "$existing_pkg" "$DSH_MANIFEST" "$profile")" \
-    || { echo "fallo el merge de package.json" >&2; return 1; }
-  merged_ws="$(python3 "$DSH_MANAGE_DIR/plugins/merge-pnpm-workspace.py" "$existing_ws" "$DSH_MANIFEST")" \
-    || { echo "fallo el merge de pnpm-workspace.yaml" >&2; return 1; }
-
-  printf '%s' "$merged_pkg" > "$existing_pkg"
-  printf '%s' "$merged_ws" > "$existing_ws"
-
-  # Copiar los .patch declarados en el manifest — no pisar uno que el humano
-  # ya haya customizado a mano con el mismo nombre de archivo.
-  local patch_file dest
-  for patch_file in "$DSH_MANAGE_DIR"/plugins/patches/*.patch; do
-    [ -e "$patch_file" ] || continue
-    dest="$profile_dir/patches/$(basename "$patch_file")"
-    if [ ! -f "$dest" ]; then
-      cp "$patch_file" "$dest"
-    fi
-  done
-
+  # Gate de resguardo ANTES de tocar nada -- ni el merge de package.json ni
+  # la copia de patches dependen de este bloque (solo lee $DSH_MANIFEST y
+  # node_modules preexistente), asi que corre primero: "antes de pnpm
+  # install O EL EQUIVALENTE MERGE" del spec se cumple literalmente, no
+  # solo "antes de pnpm install".
   echo "revisando si el stack a instalar afecta sesiones existentes..."
   local manifest_pkgs
   manifest_pkgs="$(node -e "
@@ -391,6 +371,31 @@ plugins_install() {
       return 1
     }
   fi
+
+  echo "instalando stack de plugins homologado en profile '$profile' ($profile_dir)..."
+  mkdir -p "$profile_dir/patches"
+
+  local existing_pkg="$profile_dir/package.json"
+  local existing_ws="$profile_dir/pnpm-workspace.yaml"
+  local merged_pkg merged_ws
+  merged_pkg="$(node "$DSH_MANAGE_DIR/plugins/merge-package-json.mjs" "$existing_pkg" "$DSH_MANIFEST" "$profile")" \
+    || { echo "fallo el merge de package.json" >&2; return 1; }
+  merged_ws="$(python3 "$DSH_MANAGE_DIR/plugins/merge-pnpm-workspace.py" "$existing_ws" "$DSH_MANIFEST")" \
+    || { echo "fallo el merge de pnpm-workspace.yaml" >&2; return 1; }
+
+  printf '%s' "$merged_pkg" > "$existing_pkg"
+  printf '%s' "$merged_ws" > "$existing_ws"
+
+  # Copiar los .patch declarados en el manifest — no pisar uno que el humano
+  # ya haya customizado a mano con el mismo nombre de archivo.
+  local patch_file dest
+  for patch_file in "$DSH_MANAGE_DIR"/plugins/patches/*.patch; do
+    [ -e "$patch_file" ] || continue
+    dest="$profile_dir/patches/$(basename "$patch_file")"
+    if [ ! -f "$dest" ]; then
+      cp "$patch_file" "$dest"
+    fi
+  done
 
   echo "corriendo pnpm install..."
   # pnpm (a diferencia de npm) no tiene un flag --allow-scripts: los builds
