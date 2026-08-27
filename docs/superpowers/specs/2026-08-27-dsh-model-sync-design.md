@@ -73,6 +73,8 @@ La fuente de verdad de disponibilidad será el catálogo devuelto por el endpoin
 - Para modelos nuevos se adoptan `id`, `name`, `contextWindow` y `maxTokens` cuando el endpoint los proporcione.
 - No se modifican otros campos del provider.
 - El orden final seguirá primero el orden anunciado por el endpoint; los modelos ausentes que el usuario decida conservar quedan al final en su orden local.
+- Solo se admite un provider cuya dirección de settings apunte a su propio perfil. Un `settingsPath` vacío direcciona la sección completa y no permite ubicar un perfil, por lo que ese provider se descarta en lugar de escribir en una ruta incorrecta.
+- El diff pertenece al provider con el que fue descubierto. Cambiar de provider descarta el diff y la selección vigentes, de modo que nunca se pueda aplicar el catálogo de un provider sobre otro.
 
 ## Protección del modelo predeterminado
 
@@ -105,7 +107,7 @@ La vista utilizará variables CSS del tema de DSH, controles accesibles y texto 
 
 - Los errores de `discoverModels` se muestran sin alterar settings.
 - Una respuesta sin modelos se trata como advertencia, no como orden automática de borrar todo.
-- La eliminación total requiere una confirmación reforzada y no se seleccionará automáticamente cuando el catálogo descubierto esté vacío.
+- Dejar un provider sin ningún modelo lo vuelve inutilizable, por lo que se rechaza: si la selección produce una lista final vacía, la operación se bloquea con un mensaje explicativo y el usuario debe conservar al menos un modelo.
 - Un conflicto `expectedRevision` cancela el guardado y recarga el estado.
 - Si falla `settings.mutate`, la UI conserva el diff y la selección para poder reintentar.
 - IDs vacíos o duplicados se descartan/normalizan antes de comparar; nunca se persisten duplicados.
