@@ -764,7 +764,7 @@ time.sleep(2)
   cat > "$DSH_HOME/profiles/web/package.json" <<'EOF'
 {"name":"web","dependencies":{"paquete-inexistente":"1.0.0"}}
 EOF
-  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-inexistente web < /dev/null
+  run env DSH_PORT=39231 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-inexistente web < /dev/null
   [ "$status" -ne 0 ]
   [[ "$output" == *"--yes"* ]] || [[ "$output" == *"TTY"* ]]
 }
@@ -773,7 +773,7 @@ EOF
   install_fake_harness 48
   mkdir -p "$DSH_HOME/profiles/web"
   echo '{"name":"web","dependencies":{}}' > "$DSH_HOME/profiles/web/package.json"
-  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-que-no-existe web --yes
+  run env DSH_PORT=39232 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-que-no-existe web --yes
   [ "$status" -ne 0 ]
 }
 
@@ -819,7 +819,7 @@ EOF
   cat > "$DSH_HOME/profiles/repro/package.json" <<'EOF'
 {"name":"repro","dependencies":{"paquete-en-repro":"1.0.0"}}
 EOF
-  run bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-en-repro repro --yes
+  run env DSH_PORT=39233 bash "$BATS_TEST_DIRNAME/../dsh-manage.sh" plugins-remove paquete-en-repro repro --yes
   [[ "$output" == *"no hace falta reiniciar dsh"* ]]
   [[ "$output" != *"reiniciando dsh"* ]]
 }
