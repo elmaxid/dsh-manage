@@ -875,8 +875,20 @@ EOF
 EOF
   run bash -c "
     export DSH_MANIFEST='$manifest'
+    export DSH_PORT=39234
+    export DSH_START_TIMEOUT=1
     source '$BATS_TEST_DIRNAME/../dsh-manage.sh' --lib && plugins_install web
   "
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"gate de resguardo"* ]] || [[ "$output" == *"no se pudo leer"* ]] || [[ "$output" == *"harness"* ]]
+  # rc exacto (no solo != 0): un rc!=0 tardio (ej. el merge o el restart
+  # fallando por otro motivo) tambien satisface "!= 0" sin probar que el
+  # gate abortó DONDE debia. El mensaje exacto + las ausencias explicitas
+  # son lo que realmente distingue "el gate aborto antes de tocar nada" de
+  # "algo fallo despues, tarde, por cualquier otro motivo" (que es
+  # exactamente lo que pasaria si el chequeo guard_rc==1 se reintrodujera
+  # como fail-open: el flujo seguiria hasta pnpm install/restart_dsh y
+  # fallaria mas tarde por otra razon, dando igual un status!=0).
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"el gate de resguardo fallo con un error duro sobre 'algun-plugin'; abortando plugins-install sin instalar nada"* ]]
+  [[ "$output" != *"corriendo pnpm install"* ]]
+  [[ "$output" != *"reiniciando dsh"* ]]
 }
