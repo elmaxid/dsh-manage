@@ -1,0 +1,58 @@
+{
+  "name": "dsh-engram-recap",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Forces periodic Engram memory recall and save reminders for DeepSeek Harness agents: injects a dynamic system-prompt context that reminds the model to load prior session memory at the start of a session, and to save new decisions/bugfixes/learnings every N turns - so knowledge survives across sessions without depending on the model remembering to do it unprompted.",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "engram",
+    "memory",
+    "recap",
+    "system-prompt"
+  ],
+  "author": "elmaxid",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elmaxid/dsh-manage.git",
+    "directory": "plugins/dsh-engram-recap"
+  },
+  "homepage": "https://github.com/elmaxid/dsh-manage/tree/main/plugins/dsh-engram-recap#readme",
+  "bugs": {
+    "url": "https://github.com/elmaxid/dsh-manage/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "check": "node --check lib/index.js"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  }
+}

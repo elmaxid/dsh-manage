@@ -1,0 +1,7 @@
+# Bundle patch layer of the dsh-engram-recap plugin. Applied automatically
+# when the package is installed into a profile (a package declaring `dsh.bundle`
+# joins the profile's bundle stack). The row references the package by name;
+# mount order is controlled by the profile's dsh.profile.bundles list.
+- insert:
+    - id: engram-recap
+      name: 'dsh-engram-recap'

@@ -208,6 +208,13 @@ forma atómica (temporal + `mv -T`).
 > **en vivo** (mientras el plugin sigue corriendo) — eso no afecta a `repair`,
 > que nunca llama a `append()`.
 
+> ℹ️ **Alternativa sin tocar logs:** `patches/harness-known-session-event-types.sh`
+> declara los tipos de plugins (hoy `swarm/progress`) en el
+> `KNOWN_SESSION_EVENT_TYPES` del harness instalado: todas las sesiones
+> afectadas vuelven a cargar y las futuras no se rompen. Idempotente, con
+> backup y verificación. **Se pierde con cada actualización del harness** —
+> re-ejecutar tras cada upgrade (y reiniciar dsh para que tome efecto).
+
 > ⚠️ **Si restaurás un log a mano con `cp` (fuera de `restore`), detené DSH
 > primero** (`systemctl stop dsh.service`). El proceso vivo mantiene un
 > descriptor abierto en modo append: reemplazar el archivo por debajo hace

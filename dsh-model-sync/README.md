@@ -13,9 +13,11 @@ los modelos que tienes configurados en DSH. El resultado se presenta como un
 diff con casillas de verificación:
 
 - **Nuevo:** está en el endpoint y no en DSH. Se marca para agregar por defecto.
-- **Existente:** está en ambos. Se conserva tal cual, sin tocar su metadata local.
+- **Existente:** está en ambos. Se conserva tal cual, sin tocar su metadata local
+  (`input`, `reasoningEfforts`, `compat`, etc.).
 - **No disponible:** está en DSH y ya no aparece en el endpoint. Se marca para
-  eliminar por defecto.
+  eliminar por defecto, salvo que esté protegido: los modelos protegidos nunca
+  se preseleccionan y su casilla permanece deshabilitada con el motivo visible.
 
 Puedes cambiar cada selección antes de guardar. Al pulsar **Aplicar
 sincronización**, el plugin construye la lista final y la persiste con una sola
@@ -36,14 +38,14 @@ El plugin está diseñado para no borrar nada por accidente:
   lo vuelve inutilizable, por lo que esa operación se rechaza.
 - **Modelos protegidos contra borrado.** Están protegidos el modelo
   predeterminado del host (`host.describe`) y el modelo que la sesión actual
-  usará en su próximo paso (`sessions.models`). No son el mismo modelo: este
-  despliegue tiene `claude-sonnet-5` como predeterminado mientras la sesión
-  activa corre `claude-opus-5`. Si la lista final elimina un modelo protegido
-  del mismo provider, la operación queda bloqueada y la UI nombra cada modelo
-  que impide la sincronización y por qué está protegido. Si una fuente de
-  protección no se puede leer, esa ausencia se trata como *desconocida*, nunca
-  como *nada que proteger*: mientras haya una fuente ilegible se rechaza toda
-  eliminación, aunque las adiciones siguen permitidas.
+  usará en su próximo paso (`sessions.models`). No son necesariamente el mismo:
+  en este despliegue el predeterminado es `deepseek-v4-flash-ollama`. Si la
+  lista final elimina un modelo protegido del mismo provider, la operación
+  queda bloqueada y la UI nombra cada modelo que impide la sincronización y
+  por qué está protegido. Si una fuente de protección no se puede leer, esa
+  ausencia se trata como *desconocida*, nunca como *nada que proteger*: mientras
+  haya una fuente ilegible se rechaza toda eliminación, aunque las adiciones
+  siguen permitidas.
 - **Escritura con revisión.** La operación `settings.mutate` usa
   `expectedRevision` para no pisar cambios concurrentes. Si otro proceso
   modificó la configuración mientras tanto, el guardado se cancela, se recarga

@@ -5,6 +5,21 @@ versionado según [SemVer](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Agregado
+
+- `patches/harness-known-session-event-types.sh` — parche al harness instalado
+  que declara los tipos de eventos de sesión de plugins (hoy `swarm/progress`
+  de `dsh-kimicode-swarm`) en el `KNOWN_SESSION_EVENT_TYPES` de
+  `@deepseek-ai/dsh-session`. Motivo: `Session.append()` en `0.1.1-rc.2`
+  descarta el flag `ignorable` y el lector
+  (`dsh-session-persistence.assertEventsSupported`) rechaza la sesión completa
+  con `SessionFormatUnsupportedError` — el historial deja de cargar. Con el
+  parche, las sesiones afectadas vuelven a cargar **sin tocar logs** y las
+  futuras no se rompen. Idempotente, con backup y verificación por import real
+  del módulo. Se pierde con cada actualización del harness: re-ejecutar y
+  reiniciar dsh. Alternativa puntual (log a log, requiere DSH detenido):
+  `session-backup repair --mark-ignorable`.
+
 ### Actualizado
 
 - `@linxin666/dsh-client-ui-git-graph`, `@linxin666/dsh-client-ui-plugin-manager`,
