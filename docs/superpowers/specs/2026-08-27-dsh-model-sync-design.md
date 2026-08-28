@@ -76,17 +76,24 @@ La fuente de verdad de disponibilidad será el catálogo devuelto por el endpoin
 - Solo se admite un provider cuya dirección de settings apunte a su propio perfil. Un `settingsPath` vacío direcciona la sección completa y no permite ubicar un perfil, por lo que ese provider se descarta en lugar de escribir en una ruta incorrecta.
 - El diff pertenece al provider con el que fue descubierto. Cambiar de provider descarta el diff y la selección vigentes, de modo que nunca se pueda aplicar el catálogo de un provider sobre otro.
 
-## Protección del modelo predeterminado
+## Protección de modelos en uso
 
-Antes de aplicar, el plugin consultará la selección predeterminada expuesta por la superficie disponible del harness.
+Antes de aplicar, el plugin consultará dos fuentes de protección:
 
-Si la lista final elimina el modelo predeterminado del mismo provider:
+- el modelo predeterminado del harness (`host.describe`);
+- el modelo que la sesión actual usará en su próximo paso (`sessions.models`, con el `sessionId` que el slot ya provee).
+
+Ambas son necesarias porque no coinciden: este despliegue tiene `claude-sonnet-5` como predeterminado mientras la sesión activa corre `claude-opus-5`. Proteger solo el predeterminado dejaría borrar el modelo que el usuario está usando en ese momento.
+
+Si la lista final elimina un modelo protegido del mismo provider:
 
 - la operación queda bloqueada;
-- la UI explica qué modelo impide la sincronización;
-- el usuario debe conservarlo o cambiar primero el modelo predeterminado.
+- la UI nombra cada modelo que impide la sincronización y por qué está protegido;
+- el usuario debe conservarlo, o cambiar primero el modelo predeterminado o el de la sesión.
 
-Si la API client actual no expone esa selección, el primer release aplicará una protección conservadora: no permitirá eliminar ningún modelo que figure como selección activa en el catálogo/session disponible. La ausencia de una fuente confiable nunca se interpretará como permiso para eliminar silenciosamente.
+Si alguna fuente de protección no se puede leer, esa ausencia se trata como *desconocida*, nunca como *nada que proteger*: mientras haya una fuente ilegible se rechaza toda eliminación, aunque se siguen permitiendo las adiciones. La ausencia de una fuente confiable nunca se interpretará como permiso para eliminar silenciosamente.
+
+El alcance de la garantía son esas dos fuentes. Enumerar la selección de *todas* las sesiones no es viable: `sessions.models` hace consultas vivas por provider y rechaza sesiones ocupadas, así que un barrido completo sería lento y parcialmente fallido.
 
 ## Estados de UI
 

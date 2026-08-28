@@ -4,7 +4,7 @@
 
 **Goal:** Build an installable `dsh-model-sync` bundle that adds a Models tab beside Chat, discovers the configured provider's current model catalog, previews additions/removals with checkboxes, and safely persists the selected final list.
 
-**Architecture:** A small Host entry makes the npm package a normal DSH bundle; all product interaction occurs in the Client through the existing `connection.api` domains. Pure catalog comparison and mutation construction live in shared modules with test-first coverage. The Client controller reads `llm.providers`, `settings.describe`, and `host.describe`, calls `llm.discoverModels`, and writes one revision-guarded `settings.mutate` operation; the React view only renders controller state and dispatches actions.
+**Architecture:** A small Host entry makes the npm package a normal DSH bundle; all product interaction occurs in the Client through the existing `connection.api` domains. Pure catalog comparison and mutation construction live in shared modules with test-first coverage. The Client controller reads `llm.providers`, `settings.describe`, `host.describe` and `sessions.models`, calls `llm.discoverModels`, and writes one revision-guarded `settings.mutate` operation; the React view only renders controller state and dispatches actions.
 
 **Tech Stack:** TypeScript, React 18 without JSX runtime assumptions, Cordis Client slots, DSH Host API proxy (`llm`, `settings`, `host`), tsdown, Vitest, pnpm.
 
@@ -18,7 +18,8 @@
 - Endpoint discovery is authoritative only after a non-empty successful response; an empty result never automatically removes models.
 - Preserve every local field of an existing model; adopt only `id`, `name`, `contextWindow`, and `maxTokens` for a new model.
 - New models are selected for addition by default; missing models are selected for removal by default.
-- Block a write that removes the Host default model from its default provider.
+- Block a write that removes a protected model: the Host default, or the model the current session is using. These are not the same model — this deployment defaults to `claude-sonnet-5` while running `claude-opus-5`.
+- Treat a protection source that could not be read as *unknown*, never as *nothing to protect*: while any source is unreadable, refuse every removal (additions stay allowed).
 - Keep the discovery diff and selections after a write failure so the user can retry.
 - No runtime dependency on a new visual framework; use React and DSH theme CSS variables.
 - Installation in the real `web` profile occurs only after security scanning, isolated test-drive success, and explicit user approval.
@@ -134,11 +135,49 @@ Create `cordis.patch.yml`:
       name: dsh-model-sync
 ```
 
-Create two typecheck configurations, because the two halves have incompatible global environments.
+Create two typecheck configurations, because the two halves have incompatible global environments. Both files below were verified by running `tsc` against source copied verbatim from this plan; the chain `tsc --noEmit && tsc --noEmit -p tsconfig.client.json` exits 0. Copy them exactly — every field is load-bearing.
 
-`tsconfig.json` — Node side. Strict, `"types": ["node"]`, `"lib": ["ES2022"]`, and `"include": ["src/index.ts", "src/sync.ts", "tests"]`.
+`tsconfig.json` — Node side:
 
-`tsconfig.client.json` — browser side. Strict, `"lib": ["ES2022", "DOM"]`, `"include": ["src/client"]`, and **no** `types` field. `@types/node` must not be loaded here: it declares an ambient `require`, which would collide with the closure bundle's own `require` declaration in `globals.d.ts` and fail the build.
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src/index.ts", "src/sync.ts", "tests"]
+}
+```
+
+`tsconfig.client.json` — browser side:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "types": [],
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src/client"]
+}
+```
+
+Two fields exist for reasons that are easy to get backwards:
+
+**`allowImportingTsExtensions` is required in BOTH files.** Every import in this plan carries an explicit `.ts` extension (Task 1 `export * from './sync.ts'`, the test imports, and the client's `../sync.ts`). Without the flag `tsc` refuses them outright with `TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled`, and the typecheck can never pass. The flag itself requires `noEmit`, which both files set — tsdown does the emitting, `tsc` only checks.
+
+**`"types": []` on the client is required, and is NOT the same as omitting the field.** Omitting `types` makes TypeScript implicitly include every package under `node_modules/@types`, which pulls in `@types/node` — the exact opposite of what the client needs. Its ambient `var require`, `var module` and `var exports` then collide with the closure bundle's own declarations in `globals.d.ts`, producing `TS2300: Duplicate identifier 'require'` plus two `TS2451` redeclaration errors. A `function` declaration does not merge with a `var` declaration, so this is a hard failure, not a warning. Only an explicit empty array suppresses implicit type-library inclusion. Do not reach for `skipLibCheck: true` instead: it silences the errors by skipping type-checking of your own `globals.d.ts` as well, leaving a real global-scope conflict live in the build.
 
 Create a dual-entry `tsdown.config.mjs` based on the verified `dsh-context` pattern:
 
@@ -287,9 +326,11 @@ git commit -m "feat: scaffold model sync bundle"
   - `diffModels(configured, discovered): ModelDiff`
   - `defaultSelection(diff): SyncSelection`
   - `buildFinalModels(diff, selection): ModelProfile[]`
-  - `removesDefaultModel(provider, finalModels, hostDefault): boolean`
+  - `blockedRemovals(provider, finalModels, protection, configured?): ModelProtection[]`
   - `hasNoChanges(configured, finalModels): boolean`
   - `modelsMutation(settingsPath, models): SettingsMutation` (throws on an empty path)
+
+Note there is no `removesDefaultModel`. Guarding only the Host default is not sufficient: the Host default and the model a live session is actually using are different things, and this deployment demonstrates the gap — the configured default is `claude-sonnet-5` while an active session runs `claude-opus-5`. A guard that checked only the default would happily delete the model the user is talking to right now. `blockedRemovals` replaces it and covers both sources plus the unreadable-source case.
 
 - [ ] **Step 1: Write failing diff and default-selection tests**
 
@@ -297,11 +338,12 @@ Append tests:
 
 ```ts
 import {
+  blockedRemovals,
   buildFinalModels,
   defaultSelection,
   diffModels,
+  hasNoChanges,
   modelsMutation,
-  removesDefaultModel,
 } from '../src/sync.ts'
 
 test('classifies endpoint additions, shared models, and missing configured models', () => {
@@ -391,11 +433,40 @@ test('builds endpoint order, preserves local metadata, adopts new metadata, and 
   ])
 })
 
-test('blocks removal of the host default model only on the matching provider', () => {
-  const finalModels = [{ id: 'other' }]
-  expect(removesDefaultModel('route-a', finalModels, { provider: 'route-a', model: 'default' })).toBe(true)
-  expect(removesDefaultModel('route-b', finalModels, { provider: 'route-a', model: 'default' })).toBe(false)
-  expect(removesDefaultModel('route-a', [{ id: 'default' }], { provider: 'route-a', model: 'default' })).toBe(false)
+test('blocks removing a protected model, scoped to the matching provider', () => {
+  const protection = {
+    known: [
+      { provider: 'route-a', model: 'the-default', reason: 'host-default' as const },
+      { provider: 'route-a', model: 'in-use', reason: 'active-session' as const },
+    ],
+    unknown: [],
+  }
+
+  // Both protected models are gone from the final list: both are reported.
+  expect(blockedRemovals('route-a', [{ id: 'other' }], protection).map(p => p.model))
+    .toEqual(['the-default', 'in-use'])
+
+  // Keeping them clears the block.
+  expect(blockedRemovals('route-a', [{ id: 'the-default' }, { id: 'in-use' }], protection))
+    .toEqual([])
+
+  // A protection for another provider must not block this one.
+  expect(blockedRemovals('route-b', [{ id: 'other' }], protection)).toEqual([])
+})
+
+test('blocks every removal while a protection source is unreadable', () => {
+  const protection = {
+    known: [],
+    unknown: [{ reason: 'active-session' as const, detail: 'session.models failed' }],
+  }
+
+  // Removing anything is refused: an unreadable source is unknown, not "nothing to protect".
+  expect(blockedRemovals('route-a', [{ id: 'kept' }], protection, [{ id: 'kept' }, { id: 'dropped' }]))
+    .toHaveLength(1)
+
+  // Removing nothing is still allowed, so pure additions never get stuck.
+  expect(blockedRemovals('route-a', [{ id: 'kept' }], protection, [{ id: 'kept' }]))
+    .toEqual([])
 })
 
 test('creates one set mutation at the provider models path', () => {
@@ -437,11 +508,30 @@ Rules in `buildFinalModels`:
 Define:
 
 ```ts
-export interface HostDefaultModel { provider?: string; model?: string }
+/** One model that must survive the write, and why. */
+export interface ModelProtection {
+  provider: string
+  model: string
+  reason: 'host-default' | 'active-session'
+}
+
+/** What is protected, and which sources could not be read. */
+export interface ProtectionState {
+  known: ModelProtection[]
+  /** A source that failed or answered nothing. Non-empty forbids every removal. */
+  unknown: Array<{ reason: 'host-default' | 'active-session'; detail: string }>
+}
+
 export interface SettingsMutation { op: 'set'; path: string[]; value: ModelProfile[] }
 ```
 
-`removesDefaultModel` returns true only when both default fields exist, the provider matches, and the final array lacks the exact model ID.
+`blockedRemovals(provider, finalModels, protection, configured?)` returns the protections the write would violate, empty when the write is safe:
+
+1. For each entry in `protection.known` whose `provider` matches, report it when `finalModels` lacks that exact model id.
+2. When `protection.unknown` is non-empty **and** the write removes at least one configured model, report a synthetic protection per unknown source. Determining "removes at least one" needs the `configured` list, which is why it is the fourth parameter; when omitted, treat any unknown source as blocking.
+3. A write that removes nothing is never blocked, so a pure addition still works while a source is down.
+
+Rule 2 is the spec's requirement that an unreadable source is never read as permission to delete. A failed `session.models` or `host.describe` call means *unknown*, not *nothing to protect* — the difference between those two readings is whether the plugin can silently delete the model the user is currently using.
 
 `hasNoChanges` compares the configured list against the final list by length, then by index-aligned `id`, then by deep JSON equality of each entry; it reports true only when the write would be a no-op.
 
@@ -473,7 +563,7 @@ git commit -m "feat: implement model synchronization policy"
 - Create: `dsh-model-sync/tests/controller.test.ts`
 
 **Interfaces:**
-- Consumes: `diffModels`, `defaultSelection`, `buildFinalModels`, `removesDefaultModel`, `modelsMutation`.
+- Consumes: `diffModels`, `defaultSelection`, `buildFinalModels`, `blockedRemovals`, `hasNoChanges`, `modelsMutation`.
 - Produces: `ModelSyncController` with methods `load()`, `selectProvider(id)`, `discover()`, `toggleAdd(id)`, `toggleRemove(id)`, `apply()`, `snapshot()` and `subscribe(listener)`.
 - Produces immutable `ModelSyncSnapshot` values for React `useSyncExternalStore`.
 
@@ -528,6 +618,12 @@ export interface ModelSyncApi {
   host: {
     describe(request: {}): Promise<RpcResult<{ provider?: string; model?: string }>>
   }
+  sessions: {
+    /** The model this session will use for its next step. */
+    models(request: { sessionId: string }): Promise<RpcResult<{
+      current?: { provider?: string; model?: string }
+    }>>
+  }
 }
 
 export type ModelSyncPhase = 'loading' | 'ready' | 'discovering' | 'diff' | 'applying' | 'success' | 'error'
@@ -540,8 +636,7 @@ export interface ModelSyncSnapshot {
   diff?: ModelDiff
   selection: SyncSelection
   writable: boolean
-  defaultProvider?: string
-  defaultModel?: string
+  protection: ProtectionState
   message?: string
 }
 ```
@@ -558,8 +653,9 @@ test('loads configurable providers, settings profile, revision, and host default
     providers: [{ provider: 'route-a', displayName: 'Route A', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'route-a'], active: true }],
     namespaces: [{ ns: 'llm-pi-ai', revision: 4, value: { providers: { 'route-a': { api: 'openai-completions', baseURL: 'https://example.test/v1', models: [{ id: 'old' }] } } } }],
     host: { provider: 'route-a', model: 'old' },
+    sessionCurrent: { provider: 'route-a', model: 'old' },
   })
-  const controller = new ModelSyncController(api)
+  const controller = new ModelSyncController(api, 'session-1')
 
   await controller.load()
 
@@ -567,14 +663,16 @@ test('loads configurable providers, settings profile, revision, and host default
     phase: 'ready',
     selectedProvider: 'route-a',
     configured: [{ id: 'old' }],
-    defaultProvider: 'route-a',
-    defaultModel: 'old',
   })
+  expect(controller.snapshot().protection.known).toContainEqual({
+    provider: 'route-a', model: 'old', reason: 'host-default',
+  })
+  expect(controller.snapshot().protection.unknown).toEqual([])
 })
 
 test('discovers with the provider settings address and creates default selections', async () => {
   const { api, calls } = readyFakeApi({ discovered: [{ id: 'new' }] })
-  const controller = new ModelSyncController(api)
+  const controller = new ModelSyncController(api, 'session-1')
   await controller.load()
   await controller.discover()
 
@@ -588,7 +686,7 @@ test('discovers with the provider settings address and creates default selection
 })
 
 test('returns a referentially stable snapshot between transitions', async () => {
-  const controller = new ModelSyncController(readyFakeApi({}).api)
+  const controller = new ModelSyncController(readyFakeApi({}).api, 'session-1')
   await controller.load()
 
   // Identity stability is what keeps useSyncExternalStore from looping.
@@ -600,7 +698,7 @@ test('returns a referentially stable snapshot between transitions', async () => 
 })
 
 test('exposes snapshot and subscribe as detachable references', async () => {
-  const controller = new ModelSyncController(readyFakeApi({}).api)
+  const controller = new ModelSyncController(readyFakeApi({}).api, 'session-1')
   // The view passes these as bare references; they must not need `this`.
   const { snapshot, subscribe } = controller
 
@@ -619,7 +717,7 @@ test('discards a diff belonging to another provider when the selection changes',
     ],
     discovered: [{ id: 'from-a' }],
   })
-  const controller = new ModelSyncController(api)
+  const controller = new ModelSyncController(api, 'session-1')
   await controller.load()
   await controller.discover()
   expect(controller.snapshot().diff).toBeDefined()
@@ -642,7 +740,11 @@ Expected: FAIL because `ModelSyncController` does not exist.
 
 Implementation requirements:
 
-- `load()` calls `llm.providers`, `settings.describe`, and `host.describe` concurrently.
+- The controller is constructed as `new ModelSyncController(api, sessionId)`. The `sessionId` comes from the slot's standard props — `conversation.view` is session-scoped and already supplies it, so no extra plumbing is needed.
+- `load()` calls `llm.providers`, `settings.describe`, `host.describe` and `sessions.models({ sessionId })` concurrently, then folds the last two into one `ProtectionState`:
+  - `host.describe` returning both `provider` and `model` contributes a `host-default` protection; a failed call, or a reply missing either field, contributes an `unknown` entry instead.
+  - `sessions.models` returning `current.provider` and `current.model` contributes an `active-session` protection; a failed call contributes an `unknown` entry.
+  - Never collapse a failure into "no protection". That distinction is the whole point of `ProtectionState`.
 - Keep only providers that satisfy all three conditions: a matching `settingsNs` descriptor exists, `settingsPath` is non-empty, and the addressed profile is a plain object. A provider with an empty `settingsPath` addresses the whole section and cannot be written safely, so it is filtered out here rather than failing later at write time.
 - Prefer the previously selected provider; otherwise first `active` provider; otherwise first provider.
 - `selectProvider(id)` changes the provider and, whenever the id actually differs, clears `diff` and resets `selection` to empty sets, returning to `phase: 'ready'`. A diff is only valid for the provider it was discovered against.
@@ -677,7 +779,40 @@ test('blocks applying a catalog that removes the host default model', async () =
   // configured default is missing remotely and remains selected for removal
   await controller.apply()
   expect(calls.mutate).toHaveLength(0)
-  expect(controller.snapshot().message).toContain('modelo predeterminado')
+  expect(controller.snapshot().message).toContain('predeterminado')
+})
+
+test('blocks removing the model the current session is using, even when it is not the default', async () => {
+  // Mirrors the real deployment: default is claude-sonnet-5, this session runs
+  // claude-opus-5. A default-only guard would delete the model in active use.
+  const { api, calls } = readyFakeApi({
+    configured: [{ id: 'claude-sonnet-5' }, { id: 'claude-opus-5' }],
+    host: { provider: 'route-a', model: 'claude-sonnet-5' },
+    sessionCurrent: { provider: 'route-a', model: 'claude-opus-5' },
+    discovered: [{ id: 'claude-sonnet-5' }],
+  })
+  const controller = new ModelSyncController(api, 'session-1')
+  await controller.load()
+  await controller.discover()
+  await controller.apply()
+
+  expect(calls.mutate).toHaveLength(0)
+  expect(controller.snapshot().message).toContain('claude-opus-5')
+})
+
+test('refuses any removal while a protection source could not be read', async () => {
+  const { api, calls } = readyFakeApi({
+    configured: [{ id: 'keep' }, { id: 'gone' }],
+    discovered: [{ id: 'keep' }],
+    sessionModelsFails: true,
+  })
+  const controller = new ModelSyncController(api, 'session-1')
+  await controller.load()
+  await controller.discover()
+  await controller.apply()
+
+  expect(calls.mutate).toHaveLength(0)
+  expect(controller.snapshot().protection.unknown).toHaveLength(1)
 })
 
 test('keeps diff and selection after mutate failure', async () => {
@@ -702,7 +837,7 @@ Expected: FAIL on unimplemented apply/toggle behavior.
 1. Require a selected provider, addressed namespace, non-empty diff and writable settings.
 2. Build final models from current selection.
 3. Refuse an empty final list, publishing a message explaining that a provider without models is unusable and at least one must be kept.
-4. Refuse default-model removal, naming the blocking model in the message.
+4. Call `blockedRemovals(provider, finalModels, protection, configured)` and refuse when it returns anything, naming each blocking model and its reason: the Host default, the model this session is using, or a protection source that could not be read. Tell the user what to do — keep the model, or change the default/session model first.
 5. When `hasNoChanges(configured, finalModels)` is true, publish `phase: 'success'` with a "no changes" message and send no mutation at all.
 6. Send exactly one `settings.mutate` call with the saved revision.
 7. On success call the same private load operation, keep the provider selected, clear the diff, and publish `phase: 'success'` with a completion message.
@@ -835,7 +970,7 @@ declare module '*.css'
   - a row per new model with an “Agregar” checkbox;
   - a read-only row per existing model;
   - a row per missing model with an “Eliminar” checkbox;
-  - warning for the Host default model;
+  - a warning naming every protected model and why it is protected, plus a distinct warning when a protection source could not be read;
   - **Aplicar sincronización** button only when a diff exists;
   - loading, empty, error, conflict and success messages using `role="status"` or `role="alert"`.
 
@@ -925,20 +1060,29 @@ git commit -m "feat: add Models conversation tab"
 Create `tests/manifest.test.ts` that reads `package.json` and `cordis.patch.yml` as text and asserts:
 
 ```ts
+import { existsSync } from 'node:fs'
+
 test('declares one installable bundle and web client', () => {
   expect(pkg.dsh.bundle.patch).toBe('./cordis.patch.yml')
   expect(pkg.dsh.client.platform).toBe('web')
   expect(pkg.exports['./client']).toBe('./lib/client.js')
   expect(patch.match(/id: dsh-model-sync/g)).toHaveLength(1)
   expect(patch.match(/name: dsh-model-sync/g)).toHaveLength(1)
+  expect(pkg.files).toEqual(expect.arrayContaining(['lib', 'cordis.patch.yml', 'README.md', 'LICENSE']))
+})
+
+test('ships every file the manifest promises', () => {
+  // `files` is only an allowlist; it does not prove the file exists on disk.
+  // Without these stats the RED state below cannot happen.
+  for (const name of ['README.md', 'LICENSE']) {
+    expect(existsSync(new URL(`../${name}`, import.meta.url))).toBe(true)
+  }
 })
 ```
 
-Also assert `files` includes `lib`, `cordis.patch.yml`, `README.md`, and `LICENSE`.
-
 - [ ] **Step 2: Run the manifest test and verify RED**
 
-Expected: FAIL because README/LICENSE do not exist yet.
+Expected: the first test PASSES (Task 1 already wrote those manifest fields), and `ships every file the manifest promises` FAILS on the missing `README.md`. That second test is the real RED for this task — the manifest assertions are a regression pin, not the driver.
 
 - [ ] **Step 3: Add README and Apache-2.0 license**
 
@@ -1092,7 +1236,8 @@ Do not run this real-profile command inside Task 6.
 ## Final Verification Checklist
 
 - [ ] `pnpm test` passes all normalization, policy, controller, registration and manifest tests.
-- [ ] `pnpm typecheck` exits 0 for both the Node and the client configuration.
+- [ ] `pnpm typecheck` exits 0 for both the Node and the client configuration (needs `allowImportingTsExtensions` in both, and `"types": []` on the client).
+- [ ] A removal is refused when it would drop the Host default, the current session's model, or anything while a protection source is unreadable.
 - [ ] `snapshot()` is referentially stable between transitions, and `snapshot`/`subscribe` work as detached references.
 - [ ] Changing provider clears any diff discovered against the previous provider.
 - [ ] `modelsMutation` refuses an empty settings path, and providers with one are filtered out at load.
