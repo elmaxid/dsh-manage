@@ -5,10 +5,10 @@
     "@akslcw/dsh-negative-ledger": "^0.1.2",
     "@fakechris/dsh-restart-recover": "^0.2.1",
     "@huanlin/dsh-plugin-better-locale": "^0.1.0",
-    "@linxin666/dsh-client-ui-git-graph": "^0.3.5",
-    "@linxin666/dsh-client-ui-plugin-manager": "^0.3.5",
-    "@linxin666/dsh-client-ui-skill-explorer": "^0.3.5",
-    "@linxin666/dsh-ssh": "^0.3.5",
+    "@linxin666/dsh-client-ui-git-graph": "^0.3.6",
+    "@linxin666/dsh-client-ui-plugin-manager": "^0.3.6",
+    "@linxin666/dsh-client-ui-skill-explorer": "^0.3.6",
+    "@linxin666/dsh-ssh": "^0.3.6",
     "@perrylink/dsh-skill-pack-security-provider": "^2.2.0",
     "dsh-better-sidebar": "^0.16.1",
     "dsh-context": "^0.33.1",
@@ -98,6 +98,8 @@
   "postInstallNotes": [
     "Tras 'pnpm install', si pnpm bloquea builds nativos no cubiertos por allowBuilds (ssh2/cpu-features/node-pty), correr 'pnpm approve-builds' y aprobar solo esos tres -- no aprobar better-sqlite3 (usa prebuild, no debe compilar).",
     "dsh-doublecheck y dsh-chat-recovery quedan fuera de este manifest a propósito -- ver 'excluded' arriba.",
-    "El MCP de proyecto (engram, code-review-graph u otros) NO forma parte de este stack base: es específico de cada puesto/proyecto y se agrega aparte editando cordis.patch.yml del profile."
+    "El MCP de proyecto (engram, code-review-graph u otros) NO forma parte de este stack base: es específico de cada puesto/proyecto y se agrega aparte editando cordis.patch.yml del profile.",
+    "pnpm aplica minimumReleaseAge (cuarentena de 24h contra supply-chain de paquetes recién publicados): un 'pnpm update'/'pnpm add' a una versión con <24h de publicada resuelve silenciosamente a la versión anterior permitida, sin error visible -- confirmado con @linxin666/dsh-client-ui-git-graph@0.3.6 (publicada 12h antes) el 2026-08-28. Para adoptarla conscientemente una vez revisada: agregar '<paquete>@<version-vieja> || <version-nueva>' a pnpmWorkspace.minimumReleaseAgeExclude en pnpm-workspace.yaml del profile, luego reintentar el update normal (NO usar --config.minimum-release-age=0 como bypass ad-hoc: deja el lockfile en un estado que la propia policy rechaza en el siguiente 'pnpm install').",
+    "NUNCA correr 'pnpm clean --lockfile' para 'limpiar' una sola entrada del lockfile que viola una policy -- borra TODO node_modules Y pnpm-lock.yaml del profile completo (confirmado en carne propia: se fue con los 28 paquetes, incluidos los dos patches persistidos). El proceso dsh.service en ejecución no se ve afectado en el momento (ya tiene todo cargado en memoria), pero un restart con node_modules vacío sí fallaría. Recuperación: 'pnpm install' desde package.json reconstituye todo con normalidad si no hubo restart de por medio. Para excluir una sola versión de la policy, editar minimumReleaseAgeExclude a mano (ver nota anterior) en vez de tocar el lockfile."
   ]
 }

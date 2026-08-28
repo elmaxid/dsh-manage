@@ -3,6 +3,30 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/),
 versionado según [SemVer](https://semver.org/lang/es/).
 
+## [Unreleased]
+
+### Actualizado
+
+- `@linxin666/dsh-client-ui-git-graph`, `@linxin666/dsh-client-ui-plugin-manager`,
+  `@linxin666/dsh-client-ui-skill-explorer`, `@linxin666/dsh-ssh`: 0.3.5 → 0.3.6.
+  Verificado descargando y diffeando los tarballs reales de npm (no solo el
+  changelog) antes de adoptar:
+  - `plugin-manager`: solo bump de versión, cero cambios de lógica.
+  - `git-graph` / `skill-explorer`: refactor de seguridad — la lógica de
+    autenticación por pairing/loopback (`isPairedOrLoopbackAllowed`) se
+    centralizó en un archivo compartido generado (antes duplicada por
+    paquete); misma decisión de seguridad, solo dejó de estar duplicada.
+    `skill-explorer` además solo mejora textos de hints en la UI.
+  - `dsh-ssh`: agrega soporte de autenticación keyboard-interactive/2FA
+    (nuevo tipo de frame `auth_prompt`/`auth_response`, nuevo parámetro
+    opcional `onKeyboardInteractive`). 100% aditivo — ningún parámetro
+    existente cambia de firma, la ruta de auth por password sigue igual.
+  - Bloqueadas inicialmente por `minimumReleaseAge` de pnpm (cuarentena de
+    24h contra supply-chain de paquetes recién publicados; 0.3.6 tenía 12h
+    de publicada) — adoptadas explícitamente agregando la versión a
+    `minimumReleaseAgeExclude` en el `pnpm-workspace.yaml` del profile tras
+    la revisión, no bypaseando la policy.
+
 ## [1.4.0] - 2026-08-26
 
 ### Agregado

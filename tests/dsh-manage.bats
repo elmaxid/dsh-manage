@@ -170,7 +170,7 @@ assert 'dsh-doublecheck' not in m['dependencies'], 'dsh-doublecheck no deberia e
   [ "$status" -eq 0 ]
 }
 
-@test "manifest.json declara los 3 patches con archivo .patch presente" {
+@test "manifest.json declara sus patches con archivo .patch presente" {
   run python3 -c "
 import json, os
 base = '$BATS_TEST_DIRNAME/../plugins'
