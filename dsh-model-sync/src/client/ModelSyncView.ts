@@ -9,8 +9,10 @@ export interface ModelSyncViewProps {
   controller: ModelSyncController
 }
 
-/** Message the controller reports after an apply that found no differences. */
-const NO_CHANGES_MESSAGE = 'No hay cambios que aplicar.'
+// Imported rather than duplicated as a literal: comparing against a copy of the
+// controller's string meant rewording the message in one file silently dropped
+// the "sin cambios" branch here.
+import { NO_CHANGES_MESSAGE } from './messages.ts'
 
 const reasonLabel = (reason: ModelProtection['reason']): string =>
   reason === 'host-default' ? 'modelo predeterminado del Host' : 'modelo de la sesión actual'
@@ -33,8 +35,12 @@ export function ModelSyncView(props: ModelSyncViewProps): ReactNS.ReactElement {
   const state = React.useSyncExternalStore(controller.subscribe, controller.snapshot, controller.snapshot)
 
   React.useEffect(() => {
-    void controller.load()
-  }, [])
+    // Controllers outlive the mounted view (they are kept per session), and
+    // `load()` resets diff and selection. Reloading unconditionally on every
+    // mount discarded a curated set of checkboxes whenever the user switched
+    // tabs and came back — and twice over under StrictMode.
+    if (controller.snapshot().phase === 'loading') void controller.load()
+  }, [controller])
 
   const busy = state.phase === 'loading' || state.phase === 'discovering' || state.phase === 'applying'
   const selectId = React.useId()

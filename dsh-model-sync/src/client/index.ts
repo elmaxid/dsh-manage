@@ -25,6 +25,8 @@ import type { ModelSyncApi } from './types.ts'
 /** Structural face of the Cordis client context used by this plugin. */
 interface ClientContext {
   get(service: string): unknown
+  /** Present on a real Cordis fiber; guarded because the tests fake this shape. */
+  effect?(callback: () => () => void): void
   slots: {
     inject(name: string, callback: () => () => void): () => void
     register(options: Record<string, unknown>, component: (props: unknown) => unknown): () => void
@@ -66,9 +68,22 @@ export function apply(ctx: unknown): void {
 
   const component = (props: unknown) => {
     const sessionId = (props as ConversationViewProps | null | undefined)?.sessionId
-    const key = typeof sessionId === 'string' && sessionId !== '' ? sessionId : ''
-    return h(ModelSyncView, { controller: controllerFor(key) })
+    // Without a real session id the protection sources cannot be queried for
+    // the session this tab is showing. Collapsing to a shared '' key would let
+    // two unrelated views share one controller and would query
+    // `sessions.models({ sessionId: '' })`. Refuse instead of degrading.
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      return h('div', { className: 'dms-empty' }, 'No se pudo identificar la sesión; abre la pestaña desde una conversación.')
+    }
+    return h(ModelSyncView, { controller: controllerFor(sessionId) })
   }
 
-  registerModelSyncView(context.slots, component)
+  // The slot disposer is the single owner of this plugin's teardown, so it must
+  // be retained rather than discarded: it also drops the per-session
+  // controllers, which otherwise outlive every session the tab ever showed.
+  const disposeSlot = registerModelSyncView(context.slots, component)
+  context.effect?.(() => () => {
+    disposeSlot()
+    controllers.clear()
+  })
 }

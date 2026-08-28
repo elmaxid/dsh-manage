@@ -73,7 +73,6 @@ function fakeApi(options: Options = {}) {
   return { api, calls }
 }
 
-const readyFakeApi = fakeApi
 
 describe('ModelSyncController regressions', () => {
   /**
@@ -136,7 +135,7 @@ describe('ModelSyncController regressions', () => {
   })
 
   test('surfaces a transport rejection instead of freezing in applying', async () => {
-    const { api } = readyFakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
+    const { api } = fakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
     // An `ok: false` envelope is a business failure; a thrown rejection is a
     // transport failure, and only the latter used to escape uncaught.
     api.settings.mutate = async () => { throw new Error('connection lost') }
@@ -148,7 +147,7 @@ describe('ModelSyncController regressions', () => {
   })
 
   test('reports a failed reload instead of claiming success over an empty view', async () => {
-    const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
+    const { api, calls } = fakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load(); await controller.discover()
     // Break the reload only after the write has been accepted.
@@ -160,7 +159,7 @@ describe('ModelSyncController regressions', () => {
   })
 
   test('ignores a discovery started while another is already in flight', async () => {
-    const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
+    const { api, calls } = fakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load()
     await Promise.all([controller.discover(), controller.discover()])
@@ -186,7 +185,7 @@ describe('ModelSyncController', () => {
   })
 
   test('filters providers with an empty settings path', async () => {
-    const { api } = readyFakeApi({
+    const { api } = fakeApi({
       providers: [
         { provider: 'unsafe', displayName: 'Unsafe', settingsNs: 'llm-pi-ai', settingsPath: [], active: true },
         { provider: 'route-a', displayName: 'Route A', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'route-a'], active: false },
@@ -198,7 +197,7 @@ describe('ModelSyncController', () => {
   })
 
   test('discovers with the provider settings address and creates default selections', async () => {
-    const { api, calls } = readyFakeApi({ discovered: [{ id: 'new' }] })
+    const { api, calls } = fakeApi({ discovered: [{ id: 'new' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load()
     await controller.discover()
@@ -208,7 +207,7 @@ describe('ModelSyncController', () => {
   })
 
   test('returns a referentially stable snapshot between transitions', async () => {
-    const controller = new ModelSyncController(readyFakeApi({}).api, 'session-1')
+    const controller = new ModelSyncController(fakeApi({}).api, 'session-1')
     await controller.load()
     expect(controller.snapshot()).toBe(controller.snapshot())
     const before = controller.snapshot()
@@ -217,7 +216,7 @@ describe('ModelSyncController', () => {
   })
 
   test('exposes snapshot and subscribe as detachable references', async () => {
-    const controller = new ModelSyncController(readyFakeApi({}).api, 'session-1')
+    const controller = new ModelSyncController(fakeApi({}).api, 'session-1')
     const { snapshot, subscribe } = controller
     expect(() => snapshot()).not.toThrow()
     const unsubscribe = subscribe(() => {})
@@ -227,7 +226,7 @@ describe('ModelSyncController', () => {
   })
 
   test('discards a diff belonging to another provider when the selection changes', async () => {
-    const { api } = readyFakeApi({
+    const { api } = fakeApi({
       providers: [
         { provider: 'route-a', displayName: 'A', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'route-a'], active: true },
         { provider: 'route-b', displayName: 'B', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'route-b'], active: true },
@@ -248,7 +247,7 @@ describe('ModelSyncController', () => {
   })
 
   test('keeps selections immutable, isolated by group, and invalidates acknowledgement', async () => {
-    const controller = new ModelSyncController(readyFakeApi({
+    const controller = new ModelSyncController(fakeApi({
       configured: [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }], discovered: [{ id: 'a' }, { id: 'new' }],
     }).api, 'session-1')
     await controller.load()
@@ -268,7 +267,7 @@ describe('ModelSyncController', () => {
   })
 
   test('reports an empty discovery without auto-removing models', async () => {
-    const controller = new ModelSyncController(readyFakeApi({ discovered: [] }).api, 'session-1')
+    const controller = new ModelSyncController(fakeApi({ discovered: [] }).api, 'session-1')
     await controller.load()
     await controller.discover()
     expect(controller.snapshot()).toMatchObject({ phase: 'error', diff: undefined })
@@ -276,7 +275,7 @@ describe('ModelSyncController', () => {
   })
 
   test('writes exactly one revision-guarded models mutation and reloads after success', async () => {
-    const { api, calls } = readyFakeApi({ discovered: [{ id: 'old' }, { id: 'new' }] })
+    const { api, calls } = fakeApi({ discovered: [{ id: 'old' }, { id: 'new' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load()
     await controller.discover()
@@ -286,7 +285,7 @@ describe('ModelSyncController', () => {
   })
 
   test('blocks applying a catalog that removes the host default model', async () => {
-    const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }, { id: 'gone' }], host: { provider: 'route-a', model: 'gone' }, sessionCurrent: { provider: 'route-a', model: 'old' }, discovered: [{ id: 'old' }] })
+    const { api, calls } = fakeApi({ configured: [{ id: 'old' }, { id: 'gone' }], host: { provider: 'route-a', model: 'gone' }, sessionCurrent: { provider: 'route-a', model: 'old' }, discovered: [{ id: 'old' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load(); await controller.discover()
     // The host default is never preselected for removal: the UI must not offer
@@ -300,7 +299,7 @@ describe('ModelSyncController', () => {
   })
 
   test('refuses the write when a protected model is forced into the removal set', async () => {
-    const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }, { id: 'gone' }], host: { provider: 'route-a', model: 'gone' }, sessionCurrent: { provider: 'route-a', model: 'old' }, discovered: [{ id: 'old' }] })
+    const { api, calls } = fakeApi({ configured: [{ id: 'old' }, { id: 'gone' }], host: { provider: 'route-a', model: 'gone' }, sessionCurrent: { provider: 'route-a', model: 'old' }, discovered: [{ id: 'old' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load(); await controller.discover()
     // Bypassing the UI (which disables the box) must still hit the guard in
@@ -313,7 +312,7 @@ describe('ModelSyncController', () => {
   })
 
   test('blocks removing the model the current session is using, even when it is not the default', async () => {
-    const { api, calls } = readyFakeApi({
+    const { api, calls } = fakeApi({
       configured: [{ id: 'claude-sonnet-5' }, { id: 'claude-opus-5' }],
       host: { provider: 'route-a', model: 'claude-sonnet-5' }, sessionCurrent: { provider: 'route-a', model: 'claude-opus-5' },
       discovered: [{ id: 'claude-sonnet-5' }],
@@ -330,14 +329,14 @@ describe('ModelSyncController', () => {
 
   test('preserves per-model fields the plugin never adopts through the whole controller path', async () => {
     const configured = [{ id: 'keep', contextWindow: 128000, input: ['text', 'image'], reasoningEfforts: { low: 'minimal' }, compat: { maxTokensField: 'offer' } }]
-    const { api, calls } = readyFakeApi({ configured, host: { provider: 'route-a', model: 'keep' }, sessionCurrent: { provider: 'route-a', model: 'keep' }, discovered: [{ id: 'keep', contextWindow: 999 }, { id: 'new' }] })
+    const { api, calls } = fakeApi({ configured, host: { provider: 'route-a', model: 'keep' }, sessionCurrent: { provider: 'route-a', model: 'keep' }, discovered: [{ id: 'keep', contextWindow: 999 }, { id: 'new' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load(); await controller.discover(); await controller.apply()
     expect((calls.mutate[0]?.ops[0]?.value as ModelProfile[])[0]).toEqual(configured[0])
   })
 
   test('refuses any removal while a protection source could not be read', async () => {
-    const { api, calls } = readyFakeApi({ configured: [{ id: 'keep' }, { id: 'gone' }], discovered: [{ id: 'keep' }], sessionModelsFails: true })
+    const { api, calls } = fakeApi({ configured: [{ id: 'keep' }, { id: 'gone' }], discovered: [{ id: 'keep' }], sessionModelsFails: true })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load(); await controller.discover(); await controller.apply()
     expect(calls.mutate).toHaveLength(0)
@@ -345,7 +344,7 @@ describe('ModelSyncController', () => {
   })
 
   test('keeps diff and selection after a settings conflict', async () => {
-    const { api, calls } = readyFakeApi({ discovered: [{ id: 'old' }, { id: 'new' }], mutateFails: true, mutateError: { code: 'settings-conflict', message: 'conflict' } })
+    const { api, calls } = fakeApi({ discovered: [{ id: 'old' }, { id: 'new' }], mutateFails: true, mutateError: { code: 'settings-conflict', message: 'conflict' } })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load(); await controller.discover()
     const before = controller.snapshot()
@@ -357,7 +356,7 @@ describe('ModelSyncController', () => {
   })
 
   test('requires an explicit acknowledgement before a bulk removal, then proceeds', async () => {
-    const { api, calls } = readyFakeApi({ configured: [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }], host: { provider: 'route-a', model: 'a' }, sessionCurrent: { provider: 'route-a', model: 'a' }, discovered: [{ id: 'a' }] })
+    const { api, calls } = fakeApi({ configured: [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }], host: { provider: 'route-a', model: 'a' }, sessionCurrent: { provider: 'route-a', model: 'a' }, discovered: [{ id: 'a' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load(); await controller.discover()
     expect(controller.snapshot().removalShare).toBeCloseTo(0.75)
@@ -369,7 +368,7 @@ describe('ModelSyncController', () => {
   })
 
   test('refuses an empty final catalog', async () => {
-    const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }], host: { provider: 'other', model: 'other' }, sessionCurrent: { provider: 'other', model: 'other' }, discovered: [{ id: 'new' }] })
+    const { api, calls } = fakeApi({ configured: [{ id: 'old' }], host: { provider: 'other', model: 'other' }, sessionCurrent: { provider: 'other', model: 'other' }, discovered: [{ id: 'new' }] })
     const controller = new ModelSyncController(api, 'session-1')
     await controller.load(); await controller.discover(); controller.toggleAdd('new'); await controller.apply()
     expect(calls.mutate).toHaveLength(0)

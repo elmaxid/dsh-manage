@@ -8,6 +8,7 @@ import {
   modelsMutation,
 } from '../sync.ts'
 import type { ModelProfile, ProtectionState, SyncSelection } from '../sync.ts'
+import { NO_CHANGES_MESSAGE } from './messages.ts'
 import type {
   ModelSyncApi,
   ModelSyncSnapshot,
@@ -267,7 +268,7 @@ export class ModelSyncController {
       return
     }
     if (hasNoChanges(this.state.configured, finalModels)) {
-      this.transition({ phase: 'success', message: 'No hay cambios que aplicar.' })
+      this.transition({ phase: 'success', message: NO_CHANGES_MESSAGE })
       return
     }
     const share = bulkRemovalShare(this.state.configured, finalModels)
