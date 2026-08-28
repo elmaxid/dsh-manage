@@ -11,3 +11,9 @@ dsh.pid
 # Python
 __pycache__/
 *.pyc
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+dsh-model-sync/lib/
+*.tgz
