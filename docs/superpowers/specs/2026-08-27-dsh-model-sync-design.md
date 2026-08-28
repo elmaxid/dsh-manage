@@ -102,7 +102,8 @@ El alcance de la garantía son esas dos fuentes. Enumerar la selección de *toda
 - Consultando endpoint.
 - Catálogo vacío.
 - Error de autenticación, red o respuesta inválida.
-- Diff listo con filtros y contadores.
+- Diff listo con contadores, selección por grupo y un resumen de lo que hará la aplicación.
+- Confirmación pendiente por eliminación masiva.
 - Aplicando cambios.
 - Conflicto de revisión: recargar y volver a confirmar.
 - Sin cambios.
@@ -114,6 +115,8 @@ La vista utilizará variables CSS del tema de DSH, controles accesibles y texto 
 
 - Los errores de `discoverModels` se muestran sin alterar settings.
 - Una respuesta sin modelos se trata como advertencia, no como orden automática de borrar todo.
+- Que la respuesta no esté vacía no alcanza como control de sanidad: un proxy puede devolver un subconjunto truncado, y el lector del catálogo descarta filas malformadas en silencio, así que una respuesta parcial también luce válida. Por eso, si la selección eliminaría más del 25% del catálogo configurado, se exige una confirmación explícita antes de escribir. La confirmación pertenece a esa selección exacta: cualquier cambio posterior la invalida.
+- La selección por grupo (todo / ninguno) es parte de esta protección: sin ella, deshacer una preselección masiva equivocada exigiría decenas de clics.
 - Dejar un provider sin ningún modelo lo vuelve inutilizable, por lo que se rechaza: si la selección produce una lista final vacía, la operación se bloquea con un mensaje explicativo y el usuario debe conservar al menos un modelo.
 - Un conflicto `expectedRevision` cancela el guardado y recarga el estado.
 - Si falla `settings.mutate`, la UI conserva el diff y la selección para poder reintentar.

@@ -16,7 +16,8 @@
 - Use only the official `connection.api` domains; never read or write `settings.yaml` directly and never add a custom HTTP endpoint.
 - Modify only the provider profile's `models` path through one `settings.mutate` call with `expectedRevision`.
 - Endpoint discovery is authoritative only after a non-empty successful response; an empty result never automatically removes models.
-- Preserve every local field of an existing model; adopt only `id`, `name`, `contextWindow`, and `maxTokens` for a new model.
+- Preserve every local field of an existing model, copying its entry verbatim; the `id`/`name`/`contextWindow`/`maxTokens` whitelist applies only to a model newly adopted from the endpoint.
+- Require an explicit acknowledgement before a write that removes more than 25% of the configured catalog, and offer group-level select-all/none so a large pre-selection can be undone in one action.
 - New models are selected for addition by default; missing models are selected for removal by default.
 - Block a write that removes a protected model: the Host default, or the model the current session is using. These are not the same model — this deployment defaults to `claude-sonnet-5` while running `claude-opus-5`.
 - Treat a protection source that could not be read as *unknown*, never as *nothing to protect*: while any source is unreadable, refuse every removal (additions stay allowed).
@@ -328,6 +329,7 @@ git commit -m "feat: scaffold model sync bundle"
   - `buildFinalModels(diff, selection): ModelProfile[]`
   - `blockedRemovals(provider, finalModels, protection, configured?): ModelProtection[]`
   - `hasNoChanges(configured, finalModels): boolean`
+  - `bulkRemovalShare(configured, finalModels): number`
   - `modelsMutation(settingsPath, models): SettingsMutation` (throws on an empty path)
 
 Note there is no `removesDefaultModel`. Guarding only the Host default is not sufficient: the Host default and the model a live session is actually using are different things, and this deployment demonstrates the gap — the configured default is `claude-sonnet-5` while an active session runs `claude-opus-5`. A guard that checked only the default would happily delete the model the user is talking to right now. `blockedRemovals` replaces it and covers both sources plus the unreadable-source case.
@@ -340,6 +342,7 @@ Append tests:
 import {
   blockedRemovals,
   buildFinalModels,
+  bulkRemovalShare,
   defaultSelection,
   diffModels,
   hasNoChanges,
@@ -483,6 +486,20 @@ test('refuses an empty settings path that would address the whole section', () =
   expect(() => modelsMutation([], [{ id: 'alpha' }])).toThrow(/settings path/i)
 })
 
+test('reports the share of the configured catalog a write would remove', () => {
+  const configured = [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }]
+
+  expect(bulkRemovalShare(configured, configured)).toBe(0)
+  expect(bulkRemovalShare(configured, [{ id: 'a' }, { id: 'b' }, { id: 'c' }])).toBeCloseTo(0.25)
+  expect(bulkRemovalShare(configured, [{ id: 'a' }])).toBeCloseTo(0.75)
+
+  // Additions alone never register as removal pressure.
+  expect(bulkRemovalShare(configured, [...configured, { id: 'e' }])).toBe(0)
+
+  // An empty starting catalog has nothing to remove; never divide by zero.
+  expect(bulkRemovalShare([], [{ id: 'a' }])).toBe(0)
+})
+
 test('detects an unchanged catalog by id and order', () => {
   const configured = [{ id: 'a', contextWindow: 10 }, { id: 'b' }]
   expect(hasNoChanges(configured, [{ id: 'a', contextWindow: 10 }, { id: 'b' }])).toBe(true)
@@ -535,6 +552,8 @@ Rule 2 is the spec's requirement that an unreadable source is never read as perm
 
 `hasNoChanges` compares the configured list against the final list by length, then by index-aligned `id`, then by deep JSON equality of each entry; it reports true only when the write would be a no-op.
 
+`bulkRemovalShare` returns removed-ids ÷ configured-count, in `0..1`, and `0` for an empty configured list. It exists because non-emptiness is a weak sanity check: a proxy serving a truncated subset returns a perfectly valid non-empty catalog, and `readListing` silently skips malformed rows rather than failing, so a partially corrupt reply also reads as a smaller successful catalog. With 41 models configured here, either case pre-selects dozens of removals that look legitimate.
+
 `modelsMutation` throws `new Error('settings path must address a provider profile')` when `settingsPath.length === 0`, and otherwise appends `'models'` to a copied `settingsPath`.
 
 - [ ] **Step 8: Run all sync tests and typecheck**
@@ -564,7 +583,7 @@ git commit -m "feat: implement model synchronization policy"
 
 **Interfaces:**
 - Consumes: `diffModels`, `defaultSelection`, `buildFinalModels`, `blockedRemovals`, `hasNoChanges`, `modelsMutation`.
-- Produces: `ModelSyncController` with methods `load()`, `selectProvider(id)`, `discover()`, `toggleAdd(id)`, `toggleRemove(id)`, `apply()`, `snapshot()` and `subscribe(listener)`.
+- Produces: `ModelSyncController` with methods `load()`, `selectProvider(id)`, `discover()`, `toggleAdd(id)`, `toggleRemove(id)`, `toggleAllAdds()`, `toggleAllRemovals()`, `acknowledgeBulk()`, `apply()`, `snapshot()` and `subscribe(listener)`.
 - Produces immutable `ModelSyncSnapshot` values for React `useSyncExternalStore`.
 
 **Two hard requirements, both of which crash the tab if missed:**
@@ -637,11 +656,19 @@ export interface ModelSyncSnapshot {
   selection: SyncSelection
   writable: boolean
   protection: ProtectionState
+  /** Share of the configured catalog the current selection would remove (0..1). */
+  removalShare: number
+  /** Set once the user acknowledges a bulk removal; cleared by any change. */
+  bulkAcknowledged: boolean
   message?: string
 }
 ```
 
-Add internal helpers `unwrap`, `objectAtPath`, and `profileFrom(namespace, provider)` in `controller.ts`; they must copy only leaf JSON fields used by the plugin.
+Add internal helpers `unwrap`, `objectAtPath`, and `profileFrom(namespace, provider)` in `controller.ts`.
+
+**`profileFrom` narrows the provider envelope, never the model entries.** It reads only the envelope fields this plugin needs — `api`, `baseURL`, and `models` — and ignores the rest of the profile (`apiKeyEnv`, `modelOverrides`, `compat`, retry settings, and anything a future schema adds). But each entry inside `models` is copied **verbatim as JSON-owned data**, with no field whitelist.
+
+This distinction matters because the four fields the plugin *adopts* for a new model (`id`, `name`, `contextWindow`, `maxTokens`) are a strict subset of what the schema allows on an existing one — `modelProfile` also permits `input`, `reasoningEfforts`, and a per-model `compat`. Reusing the adoption whitelist when reading existing models would silently strip those on the next write. Copy whole entries; the adoption whitelist applies only to models being newly adopted from the endpoint.
 
 - [ ] **Step 2: Write failing controller load/discovery tests**
 
@@ -745,6 +772,9 @@ Implementation requirements:
   - `host.describe` returning both `provider` and `model` contributes a `host-default` protection; a failed call, or a reply missing either field, contributes an `unknown` entry instead.
   - `sessions.models` returning `current.provider` and `current.model` contributes an `active-session` protection; a failed call contributes an `unknown` entry.
   - Never collapse a failure into "no protection". That distinction is the whole point of `ProtectionState`.
+- `toggleAllAdds()` and `toggleAllRemovals()` operate on their own group only: if every id in the group is already selected they clear it, otherwise they select all of it. They never touch the other group, and like the single toggles they copy the sets rather than mutating a published snapshot.
+- Every action that changes the selection — `toggleAdd`, `toggleRemove`, `toggleAllAdds`, `toggleAllRemovals`, `discover`, `selectProvider` — recomputes `removalShare` from the would-be final list and resets `bulkAcknowledged` to `false`. An acknowledgement belongs to the exact selection that earned it.
+- `acknowledgeBulk()` sets `bulkAcknowledged` to `true` and changes nothing else.
 - Keep only providers that satisfy all three conditions: a matching `settingsNs` descriptor exists, `settingsPath` is non-empty, and the addressed profile is a plain object. A provider with an empty `settingsPath` addresses the whole section and cannot be written safely, so it is filtered out here rather than failing later at write time.
 - Prefer the previously selected provider; otherwise first `active` provider; otherwise first provider.
 - `selectProvider(id)` changes the provider and, whenever the id actually differs, clears `diff` and resets `selection` to empty sets, returning to `phase: 'ready'`. A diff is only valid for the provider it was discovered against.
@@ -800,6 +830,31 @@ test('blocks removing the model the current session is using, even when it is no
   expect(controller.snapshot().message).toContain('claude-opus-5')
 })
 
+test('preserves per-model fields the plugin never adopts, through the whole controller path', async () => {
+  // A whitelist implementation of profileFrom would pass every pure test and
+  // still silently strip these on the first write, so pin it end-to-end.
+  const configured = [{
+    id: 'keep',
+    contextWindow: 128000,
+    input: ['text', 'image'],
+    reasoningEfforts: { low: 'minimal' },
+    compat: { maxTokensField: 'offer' },
+  }]
+  const { api, calls } = readyFakeApi({
+    configured,
+    host: { provider: 'route-a', model: 'keep' },
+    sessionCurrent: { provider: 'route-a', model: 'keep' },
+    discovered: [{ id: 'keep', contextWindow: 999 }, { id: 'new' }],
+  })
+  const controller = new ModelSyncController(api, 'session-1')
+  await controller.load()
+  await controller.discover()
+  await controller.apply()
+
+  // Local metadata wins over the endpoint's, and nothing is dropped.
+  expect(calls.mutate[0].ops[0].value[0]).toEqual(configured[0])
+})
+
 test('refuses any removal while a protection source could not be read', async () => {
   const { api, calls } = readyFakeApi({
     configured: [{ id: 'keep' }, { id: 'gone' }],
@@ -824,6 +879,52 @@ test('keeps diff and selection after mutate failure', async () => {
 })
 ```
 
+```ts
+test('requires an explicit acknowledgement before a bulk removal, then proceeds', async () => {
+  // A truncated listing: 4 configured, endpoint answers with 1.
+  const { api, calls } = readyFakeApi({
+    configured: [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }],
+    host: { provider: 'route-a', model: 'a' },
+    sessionCurrent: { provider: 'route-a', model: 'a' },
+    discovered: [{ id: 'a' }],
+  })
+  const controller = new ModelSyncController(api, 'session-1')
+  await controller.load()
+  await controller.discover()
+
+  expect(controller.snapshot().removalShare).toBeCloseTo(0.75)
+
+  await controller.apply()
+  expect(calls.mutate).toHaveLength(0)
+  expect(controller.snapshot().message).toContain('3')
+
+  controller.acknowledgeBulk()
+  await controller.apply()
+  expect(calls.mutate).toHaveLength(1)
+})
+
+test('bulk toggles cover one group and invalidate a previous acknowledgement', async () => {
+  const { api } = readyFakeApi({
+    configured: [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }],
+    discovered: [{ id: 'a' }],
+  })
+  const controller = new ModelSyncController(api, 'session-1')
+  await controller.load()
+  await controller.discover()
+  controller.acknowledgeBulk()
+
+  // All removals are selected by default, so this clears them.
+  controller.toggleAllRemovals()
+  expect(controller.snapshot().selection.remove.size).toBe(0)
+  expect(controller.snapshot().selection.add.size).toBe(0) // untouched group
+  expect(controller.snapshot().bulkAcknowledged).toBe(false)
+  expect(controller.snapshot().removalShare).toBe(0)
+
+  controller.toggleAllRemovals()
+  expect(controller.snapshot().selection.remove.size).toBe(3)
+})
+```
+
 Also test that `toggleAdd` and `toggleRemove` copy the corresponding sets rather than mutating a published snapshot.
 
 - [ ] **Step 7: Run tests and verify RED for apply behavior**
@@ -839,9 +940,10 @@ Expected: FAIL on unimplemented apply/toggle behavior.
 3. Refuse an empty final list, publishing a message explaining that a provider without models is unusable and at least one must be kept.
 4. Call `blockedRemovals(provider, finalModels, protection, configured)` and refuse when it returns anything, naming each blocking model and its reason: the Host default, the model this session is using, or a protection source that could not be read. Tell the user what to do — keep the model, or change the default/session model first.
 5. When `hasNoChanges(configured, finalModels)` is true, publish `phase: 'success'` with a "no changes" message and send no mutation at all.
-6. Send exactly one `settings.mutate` call with the saved revision.
-7. On success call the same private load operation, keep the provider selected, clear the diff, and publish `phase: 'success'` with a completion message.
-8. On failure restore `phase: 'error'` while retaining `diff` and `selection`; if error code/message indicates a revision conflict, tell the user to reload and discover again.
+6. When `bulkRemovalShare(configured, finalModels) > 0.25` and `bulkAcknowledged` is false, refuse and publish a message naming how many of how many models would be removed, inviting the user to confirm. This is a speed bump, not a block: after `acknowledgeBulk()` the same apply proceeds. Re-check the share on every apply — a selection edited after acknowledging arrives with the flag already cleared.
+7. Send exactly one `settings.mutate` call with the saved revision.
+8. On success call the same private load operation, keep the provider selected, clear the diff, and publish `phase: 'success'` with a completion message.
+9. On failure restore `phase: 'error'` while retaining `diff` and `selection`; if error code/message indicates a revision conflict, tell the user to reload and discover again.
 
 - [ ] **Step 9: Run controller tests and full typecheck**
 
@@ -967,9 +1069,11 @@ declare module '*.css'
   - provider `<select>`;
   - **Buscar modelos** button;
   - counts for new/existing/missing;
-  - a row per new model with an “Agregar” checkbox;
+  - a row per new model with an “Agregar” checkbox, and a group-level “Seleccionar todo / ninguno” button calling `toggleAllAdds`;
   - a read-only row per existing model;
-  - a row per missing model with an “Eliminar” checkbox;
+  - a row per missing model with an “Eliminar” checkbox, and its own group-level toggle calling `toggleAllRemovals`;
+  - a one-line summary of what apply will do, e.g. “Se agregarán N, se conservarán M, se eliminarán K”, derived from the live selection rather than the raw diff counts;
+  - when `removalShare > 0.25` and not yet acknowledged, a prominent warning stating how many of how many models would be removed, plus an explicit confirm control calling `acknowledgeBulk`;
   - a warning naming every protected model and why it is protected, plus a distinct warning when a protection source could not be read;
   - **Aplicar sincronización** button only when a diff exists;
   - loading, empty, error, conflict and success messages using `role="status"` or `role="alert"`.
@@ -1238,6 +1342,8 @@ Do not run this real-profile command inside Task 6.
 - [ ] `pnpm test` passes all normalization, policy, controller, registration and manifest tests.
 - [ ] `pnpm typecheck` exits 0 for both the Node and the client configuration (needs `allowImportingTsExtensions` in both, and `"types": []` on the client).
 - [ ] A removal is refused when it would drop the Host default, the current session's model, or anything while a protection source is unreadable.
+- [ ] A bulk removal above 25% is refused until acknowledged, and any later selection change clears that acknowledgement.
+- [ ] Per-model fields outside the adoption whitelist survive a full load → discover → apply cycle.
 - [ ] `snapshot()` is referentially stable between transitions, and `snapshot`/`subscribe` work as detached references.
 - [ ] Changing provider clears any diff discovered against the previous provider.
 - [ ] `modelsMutation` refuses an empty settings path, and providers with one are filtered out at load.
