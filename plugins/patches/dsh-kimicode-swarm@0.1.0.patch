@@ -1,0 +1,28 @@
+diff --git a/lib/index.js b/lib/index.js
+index a0ec8b9e520c314d9b01fee1928552f007fb2e6c..0ad3f088fdff2d1c4b0fc61ac9f1b0ce4bb43226 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1627,8 +1627,22 @@ function swarmTool(ctx, getConfig) {
+ 						}],
+ 						parent: exec.agent,
+ 						signal,
++						// dsh-manage patch (2026-08-28): the explicit-model path
++						// (modelResolver.resolve's first branch) returns
++						// { model } with NO provider key. Building agentOptions
++						// with `provider: task.model.provider` here always makes
++						// that key EXIST as an explicit `undefined`, which
++						// resolveChildAgentOptions() in @deepseek-ai/dsh-subagent
++						// spreads verbatim (`...requested`), overwriting the
++						// inherited parent provider with undefined instead of
++						// leaving it untouched -- the child then starts with no
++						// route. Omitting the key entirely when there is no
++						// provider (same defensive pattern the harness itself
++						// uses elsewhere) lets the spread fall through to the
++						// parent's provider as intended. Root cause reported
++						// upstream: hongyue0721/dsh-kimicode-swarm.
+ 						agentOptions: task.model === void 0 ? void 0 : {
+-							provider: task.model.provider,
++							...task.model.provider !== void 0 ? { provider: task.model.provider } : {},
+ 							model: task.model.model
+ 						}
+ 					});
