@@ -244,7 +244,13 @@ export function ModelSyncView(props: ModelSyncViewProps): ReactNS.ReactElement {
                     h('input', {
                       type: 'checkbox',
                       checked: selectedForRemoval,
-                      disabled: busy || (protection !== undefined && !selectedForRemoval),
+                      // A protected model is never removable, so its box is
+                      // always disabled. Gating on `!selectedForRemoval` made
+                      // it a one-way latch: it rendered checked and enabled,
+                      // claiming the model would be deleted while also saying
+                      // it was protected, and once unchecked it could not be
+                      // checked again.
+                      disabled: busy || protection !== undefined,
                       onChange: () => { controller.toggleRemove(model.id) },
                     }),
                     h('span', { className: 'dms-word dms-word-remove' }, 'Eliminar'),

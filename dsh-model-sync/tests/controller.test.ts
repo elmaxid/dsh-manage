@@ -75,6 +75,99 @@ function fakeApi(options: Options = {}) {
 
 const readyFakeApi = fakeApi
 
+describe('ModelSyncController regressions', () => {
+  /**
+   * A discovery started for provider A must never be written to provider B.
+   * The dangerous shape is an ADDITIVE cross-provider diff: it removes nothing,
+   * so the bulk-removal and protection guards never fire, and the write lands
+   * silently while the UI reports success.
+   */
+  test('never writes a catalog discovered for one provider into another', async () => {
+    let release: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const providers: ProviderView[] = [
+      { provider: 'route-a', displayName: 'A', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'route-a'], active: true },
+      { provider: 'route-b', displayName: 'B', settingsNs: 'llm-pi-ai', settingsPath: ['providers', 'route-b'], active: true },
+    ]
+    const namespaces: NamespaceView[] = [{
+      ns: 'llm-pi-ai', revision: 4, value: {
+        providers: {
+          'route-a': { models: [{ id: 'a1' }] },
+          'route-b': { models: [{ id: 'b1' }, { id: 'b2' }, { id: 'b3' }, { id: 'b4' }] },
+        },
+      },
+    }]
+    const mutate: Array<{ ops: Array<{ path: string[]; value: unknown }> }> = []
+    const api = {
+      llm: {
+        providers: async () => ok({ providers }),
+        // Only route-a's discovery is slow; it resolves after the switch.
+        discoverModels: async (request: { provider?: string }) => {
+          if (request.provider === 'route-a') await gate
+          return ok({ models: [{ id: 'a1' }, { id: 'a2' }] })
+        },
+      },
+      settings: {
+        describe: async () => ok({ writable: true, namespaces }),
+        mutate: async (request: { ops: Array<{ path: string[]; value: unknown }> }) => {
+          mutate.push(request)
+          return ok({ ns: 'llm-pi-ai', revision: 5, value: namespaces[0]?.value })
+        },
+      },
+      host: { describe: async () => ok({ provider: 'route-a', model: 'a1' }) },
+      sessions: { models: async () => ok({ current: { provider: 'route-a', model: 'a1' } }) },
+    } as unknown as ModelSyncApi
+
+    const controller = new ModelSyncController(api, 'session-1')
+    await controller.load()
+    const inFlight = controller.discover()
+    controller.selectProvider('route-b')
+    release?.()
+    await inFlight
+
+    // The stale reply must not have become route-b's diff.
+    expect(controller.snapshot().diffProvider).not.toBe('route-a')
+    await controller.apply()
+    for (const request of mutate) {
+      for (const op of request.ops) {
+        expect(op.path).not.toEqual(['providers', 'route-b', 'models'])
+      }
+    }
+  })
+
+  test('surfaces a transport rejection instead of freezing in applying', async () => {
+    const { api } = readyFakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
+    // An `ok: false` envelope is a business failure; a thrown rejection is a
+    // transport failure, and only the latter used to escape uncaught.
+    api.settings.mutate = async () => { throw new Error('connection lost') }
+    const controller = new ModelSyncController(api, 'session-1')
+    await controller.load(); await controller.discover()
+    await expect(controller.apply()).resolves.toBeUndefined()
+    expect(controller.snapshot().phase).toBe('error')
+    expect(controller.snapshot().message).toContain('connection lost')
+  })
+
+  test('reports a failed reload instead of claiming success over an empty view', async () => {
+    const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
+    const controller = new ModelSyncController(api, 'session-1')
+    await controller.load(); await controller.discover()
+    // Break the reload only after the write has been accepted.
+    api.llm.providers = async () => fail('providers unavailable')
+    await controller.apply()
+    expect(calls.mutate).toHaveLength(1)
+    expect(controller.snapshot().message).not.toContain('correctamente')
+    expect(controller.snapshot().message).toContain('no se pudo recargar')
+  })
+
+  test('ignores a discovery started while another is already in flight', async () => {
+    const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }], discovered: [{ id: 'old' }, { id: 'new' }] })
+    const controller = new ModelSyncController(api, 'session-1')
+    await controller.load()
+    await Promise.all([controller.discover(), controller.discover()])
+    expect(calls.discover).toHaveLength(1)
+  })
+})
+
 describe('ModelSyncController', () => {
   test('loads configurable providers, settings profile, revision, and host default', async () => {
     const api = fakeApi({
@@ -195,7 +288,26 @@ describe('ModelSyncController', () => {
   test('blocks applying a catalog that removes the host default model', async () => {
     const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }, { id: 'gone' }], host: { provider: 'route-a', model: 'gone' }, sessionCurrent: { provider: 'route-a', model: 'old' }, discovered: [{ id: 'old' }] })
     const controller = new ModelSyncController(api, 'session-1')
-    await controller.load(); await controller.discover(); await controller.apply()
+    await controller.load(); await controller.discover()
+    // The host default is never preselected for removal: the UI must not offer
+    // a deletion that `apply` is guaranteed to refuse.
+    expect(controller.snapshot().selection.remove.has('gone')).toBe(false)
+    await controller.apply()
+    // It is still absent remotely, so it stays in the catalog and the write is
+    // a genuine no-op rather than a blocked error.
+    expect(calls.mutate).toHaveLength(0)
+    expect(controller.snapshot().message).toContain('No hay cambios')
+  })
+
+  test('refuses the write when a protected model is forced into the removal set', async () => {
+    const { api, calls } = readyFakeApi({ configured: [{ id: 'old' }, { id: 'gone' }], host: { provider: 'route-a', model: 'gone' }, sessionCurrent: { provider: 'route-a', model: 'old' }, discovered: [{ id: 'old' }] })
+    const controller = new ModelSyncController(api, 'session-1')
+    await controller.load(); await controller.discover()
+    // Bypassing the UI (which disables the box) must still hit the guard in
+    // `apply`: the view is a convenience, not the enforcement point.
+    controller.toggleRemove('gone')
+    expect(controller.snapshot().selection.remove.has('gone')).toBe(true)
+    await controller.apply()
     expect(calls.mutate).toHaveLength(0)
     expect(controller.snapshot().message).toContain('predeterminado')
   })
@@ -207,7 +319,11 @@ describe('ModelSyncController', () => {
       discovered: [{ id: 'claude-sonnet-5' }],
     })
     const controller = new ModelSyncController(api, 'session-1')
-    await controller.load(); await controller.discover(); await controller.apply()
+    await controller.load(); await controller.discover()
+    // The active session model is protected independently of the host default.
+    expect(controller.snapshot().selection.remove.has('claude-opus-5')).toBe(false)
+    controller.toggleRemove('claude-opus-5')
+    await controller.apply()
     expect(calls.mutate).toHaveLength(0)
     expect(controller.snapshot().message).toContain('claude-opus-5')
   })

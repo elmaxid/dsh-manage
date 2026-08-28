@@ -43,6 +43,13 @@ export interface ModelSyncSnapshot {
   selectedProvider?: string
   configured: ModelProfile[]
   diff?: ModelDiff
+  /**
+   * Provider route the current `diff` was discovered against. `apply` refuses to
+   * write when it no longer matches the selected provider, so a discovery that
+   * resolves after the user switched providers can never be written into another
+   * provider's settings path.
+   */
+  diffProvider?: string
   selection: SyncSelection
   writable: boolean
   protection: ProtectionState

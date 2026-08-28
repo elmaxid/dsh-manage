@@ -20,3 +20,22 @@ test('ships every file the manifest promises', () => {
     expect(existsSync(new URL(`../${name}`, import.meta.url))).toBe(true)
   }
 })
+
+test('every declared entry point resolves to a built file', () => {
+  // This is the check that was missing while the build emitted `index.mjs`
+  // against a manifest promising `index.js`: `files` listed `lib`, every other
+  // assertion passed, and the host row still resolved to a nonexistent file.
+  // Derive the paths from the manifest so renaming an entry cannot escape it.
+  const entries = [
+    pkg.main,
+    pkg.types,
+    pkg.exports['.'].default,
+    pkg.exports['.'].types,
+    pkg.exports['./client'],
+  ]
+  for (const entry of entries) {
+    expect(entry, 'manifest entry must be declared').toBeTypeOf('string')
+    const missing = !existsSync(new URL(`../${entry.replace(/^\.\//, '')}`, import.meta.url))
+    expect(missing, `${entry} is declared in package.json but was not built`).toBe(false)
+  }
+})

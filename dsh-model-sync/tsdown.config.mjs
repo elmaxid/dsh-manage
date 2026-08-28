@@ -62,6 +62,12 @@ export default defineConfig([
     target: 'node22',
     dts: true,
     clean: true,
+    // `"type": "module"` makes tsdown default to `.mjs`/`.d.mts`, but the
+    // manifest (and the dsh-context package this bundle is modelled on) promise
+    // `lib/index.js` + `lib/index.d.ts`. Without pinning both extensions the
+    // host row resolves to a file that was never emitted and the plugin fails
+    // to load. `tests/manifest.test.ts` asserts the emitted names.
+    outExtensions: () => ({ js: '.js', dts: '.d.ts' }),
     deps: { neverBundle: (specifier) => CLIENT_EXTERNALS.includes(specifier) },
   },
   {

@@ -10,7 +10,6 @@ import {
 import type { ModelProfile, ProtectionState, SyncSelection } from '../sync.ts'
 import type {
   ModelSyncApi,
-  ModelSyncPhase,
   ModelSyncSnapshot,
   NamespaceView,
   ProviderView,
@@ -117,7 +116,7 @@ export class ModelSyncController {
     if (providersResult.status !== 'fulfilled' || settingsResult.status !== 'fulfilled' || !providersResult.value.result.ok || !settingsResult.value.result.ok) {
       this.drafts = new Map()
       this.selectDraft(undefined)
-      this.transition({ phase: 'error', providers: [], selectedProvider: undefined, configured: [], diff: undefined, selection: emptySelection(), writable: false, protection: this.protectionFrom(hostResult, sessionResult), removalShare: 0, bulkAcknowledged: false, message: 'No se pudo cargar la configuración de modelos.' })
+      this.transition({ phase: 'error', providers: [], selectedProvider: undefined, configured: [], diff: undefined, diffProvider: undefined, selection: emptySelection(), writable: false, protection: this.protectionFrom(hostResult, sessionResult), removalShare: 0, bulkAcknowledged: false, message: 'No se pudo cargar la configuración de modelos.' })
       return
     }
 
@@ -141,7 +140,7 @@ export class ModelSyncController {
     const configured = this.selectedDraft?.models ?? []
     this.transition({
       phase: 'ready', providers: [...drafts.values()].map(draft => draft.provider), selectedProvider: selected,
-      configured, diff: undefined, selection: emptySelection(), writable: settings.writable,
+      configured, diff: undefined, diffProvider: undefined, selection: emptySelection(), writable: settings.writable,
       protection: this.protectionFrom(hostResult, sessionResult), removalShare: 0, bulkAcknowledged: false, message: undefined,
     })
   }
@@ -149,29 +148,59 @@ export class ModelSyncController {
   selectProvider(id: string): void {
     if (!this.drafts.has(id) || id === this.state.selectedProvider) return
     this.selectDraft(id)
-    this.transition({ phase: 'ready', selectedProvider: id, configured: this.selectedDraft?.models ?? [], diff: undefined, selection: emptySelection(), removalShare: 0, bulkAcknowledged: false, message: undefined })
+    this.transition({ phase: 'ready', selectedProvider: id, configured: this.selectedDraft?.models ?? [], diff: undefined, diffProvider: undefined, selection: emptySelection(), removalShare: 0, bulkAcknowledged: false, message: undefined })
   }
 
   async discover(): Promise<void> {
     const draft = this.selectedDraft
     if (draft === undefined) return
+    // A discovery is bound to the provider it was started for. Both guards below
+    // exist because `selectProvider` can run while this await is in flight:
+    // without them a catalog discovered for provider A is published as the diff
+    // for provider B and then written to B's settings path, destroying B's
+    // catalog. An additive cross-provider diff passes every later guard.
+    if (this.state.phase === 'discovering' || this.state.phase === 'applying') return
+    const owner = draft.provider.provider
     this.transition({ phase: 'discovering', message: undefined })
     let discovered
     try {
       discovered = unwrap(await this.api.llm.discoverModels({
-        settingsNs: draft.provider.settingsNs, provider: draft.provider.provider, baseURL: draft.baseURL, api: draft.api,
+        settingsNs: draft.provider.settingsNs, provider: owner, baseURL: draft.baseURL, api: draft.api,
       })).models
     } catch (error) {
-      this.transition({ phase: 'error', diff: undefined, selection: emptySelection(), removalShare: 0, bulkAcknowledged: false, message: error instanceof Error ? error.message : 'No se pudieron descubrir los modelos.' })
+      if (this.selectedDraft?.provider.provider !== owner) return
+      this.transition({ phase: 'error', diff: undefined, diffProvider: undefined, selection: emptySelection(), removalShare: 0, bulkAcknowledged: false, message: error instanceof Error ? error.message : 'No se pudieron descubrir los modelos.' })
       return
     }
-    if (discovered.length === 0) {
-      this.transition({ phase: 'error', diff: undefined, selection: emptySelection(), removalShare: 0, bulkAcknowledged: false, message: 'El endpoint no anunció modelos; no se aplicará ninguna eliminación.' })
+    // The selection moved on while the endpoint was answering: this reply is
+    // stale and must not touch the state of whatever provider is selected now.
+    if (this.selectedDraft?.provider.provider !== owner) return
+    if (!Array.isArray(discovered) || discovered.length === 0) {
+      this.transition({ phase: 'error', diff: undefined, diffProvider: undefined, selection: emptySelection(), removalShare: 0, bulkAcknowledged: false, message: 'El endpoint no anunció modelos; no se aplicará ninguna eliminación.' })
       return
     }
     const diff = diffModels(draft.models, discovered)
-    const selection = defaultSelection(diff)
-    this.transition({ phase: 'diff', diff, selection, removalShare: bulkRemovalShare(diff.configured, buildFinalModels(diff, selection)), bulkAcknowledged: false, message: undefined })
+    const selection = this.withoutProtected(defaultSelection(diff), owner)
+    this.transition({ phase: 'diff', diff, diffProvider: owner, selection, removalShare: bulkRemovalShare(diff.configured, buildFinalModels(diff, selection)), bulkAcknowledged: false, message: undefined })
+  }
+
+  /**
+   * Drops protected models from a removal set. `defaultSelection` is a pure
+   * function with no access to protection state, so it preselects every missing
+   * model — including the host default and the active session model. Leaving
+   * them selected made the UI promise a deletion that `apply` was always going
+   * to refuse, and made the bulk-removal share count models that can never go.
+   */
+  private withoutProtected(selection: SyncSelection, provider: string): SyncSelection {
+    const protectedIds = new Set(
+      this.state.protection.known
+        .filter(entry => entry.provider === provider)
+        .map(entry => entry.model.trim()),
+    )
+    if (protectedIds.size === 0) return selection
+    const remove = new Set<string>()
+    for (const id of selection.remove) if (!protectedIds.has(id)) remove.add(id)
+    return { add: selection.add, remove }
   }
 
   private withSelection(selection: SyncSelection): void {
@@ -204,7 +233,10 @@ export class ModelSyncController {
     const diff = this.state.diff
     if (diff === undefined) return
     const ids = diff.missing.map(model => model.id)
-    const remove = ids.every(id => this.state.selection.remove.has(id)) ? new Set<string>() : new Set(ids)
+    const all = this.withoutProtected({ add: this.state.selection.add, remove: new Set(ids) }, this.state.diffProvider ?? '')
+    const remove = [...all.remove].every(id => this.state.selection.remove.has(id)) && this.state.selection.remove.size === all.remove.size
+      ? new Set<string>()
+      : all.remove
     this.withSelection({ add: new Set(this.state.selection.add), remove })
   }
 
@@ -216,6 +248,13 @@ export class ModelSyncController {
     const draft = this.selectedDraft
     const diff = this.state.diff
     if (draft === undefined || diff === undefined || !this.state.writable) return
+    if (this.state.phase === 'applying' || this.state.phase === 'discovering') return
+    // Last line of defence: never write a catalog discovered for one provider
+    // into the settings path of another.
+    if (this.state.diffProvider !== draft.provider.provider) {
+      this.transition({ phase: 'error', message: 'El diff pertenece a otro proveedor; vuelve a descubrir los modelos.' })
+      return
+    }
     const finalModels = buildFinalModels(diff, this.state.selection)
     if (finalModels.length === 0) {
       this.transition({ phase: 'error', message: 'Un proveedor sin modelos no es utilizable; conserva al menos uno.' })
@@ -238,13 +277,28 @@ export class ModelSyncController {
       return
     }
     this.transition({ phase: 'applying', message: undefined })
-    const reply = await this.api.settings.mutate({ ns: draft.provider.settingsNs, ops: [modelsMutation(draft.provider.settingsPath, finalModels)], expectedRevision: draft.namespace.revision })
+    let reply
+    try {
+      reply = await this.api.settings.mutate({ ns: draft.provider.settingsNs, ops: [modelsMutation(draft.provider.settingsPath, finalModels)], expectedRevision: draft.namespace.revision })
+    } catch (error) {
+      // A transport rejection is not an `ok: false` envelope. Without this catch
+      // the promise escapes through the view's `void apply()` and the tab stays
+      // frozen in `applying` with every control disabled and no message.
+      this.transition({ phase: 'error', message: error instanceof Error ? error.message : 'No se pudo escribir la configuración.' })
+      return
+    }
     if (!reply.result.ok) {
       const conflict = reply.result.error.code === 'settings-conflict' || reply.result.error.message.includes('settings-conflict')
       this.transition({ phase: 'error', message: conflict ? 'La configuración cambió; recarga y descubre los modelos de nuevo.' : reply.result.error.message })
       return
     }
+    // The write landed. If the reload fails, say so instead of overwriting its
+    // error with a success banner over an empty view.
     await this.load()
+    if (this.state.phase === 'error') {
+      this.transition({ message: 'Se aplicaron los cambios, pero no se pudo recargar la configuración. Recarga la pestaña.' })
+      return
+    }
     this.transition({ phase: 'success', message: 'Modelos sincronizados correctamente.' })
   }
 }
