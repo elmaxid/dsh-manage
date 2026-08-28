@@ -1,0 +1,344 @@
+/* dsh-model-sync — scoped .dms-* styles.
+   Integrates with the host theme through --dsw-alias-* tokens; every
+   unverified token carries a fallback so the sheet degrades gracefully. */
+
+.dms-root {
+  height: 100%;
+  overflow: auto;
+  padding: 20px;
+  color: var(--dsw-alias-label-primary);
+}
+
+.dms-card {
+  border: 1px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-layer-1);
+  border-radius: 12px;
+  padding: 16px;
+  max-width: 760px;
+  margin: 0 auto;
+  display: grid;
+  gap: 14px;
+}
+
+.dms-title {
+  margin: 0;
+  font-size: 1.2rem;
+  font-weight: 600;
+}
+
+.dms-lead {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.dms-muted {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dms-danger {
+  color: var(--dsw-alias-red-primary, #d14343);
+}
+
+/* Status / error / success messages. */
+.dms-message {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+}
+
+.dms-message-text {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.dms-message-error {
+  border-color: var(--dsw-alias-red-primary, #d14343);
+  color: var(--dsw-alias-red-primary, #d14343);
+}
+
+.dms-message-ok {
+  border-color: var(--dsw-alias-green-primary, #3e9e5c);
+  color: var(--dsw-alias-green-primary, #3e9e5c);
+}
+
+.dms-message-unchanged {
+  border-style: dashed;
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* Controls. */
+.dms-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.dms-label {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dms-select {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  padding: 6px 10px;
+  min-width: 220px;
+  font: inherit;
+}
+
+.dms-button {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-2, transparent);
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.dms-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.dms-button-sm {
+  padding: 3px 10px;
+  font-size: 0.85rem;
+}
+
+.dms-button-primary {
+  border-color: var(--dsw-alias-blue-primary, #4f7cff);
+  color: var(--dsw-alias-blue-primary, #4f7cff);
+  font-weight: 600;
+}
+
+.dms-button-danger {
+  border-color: var(--dsw-alias-red-primary, #d14343);
+  color: var(--dsw-alias-red-primary, #d14343);
+  font-weight: 600;
+}
+
+/* Diff panel. */
+.dms-diff {
+  display: grid;
+  gap: 14px;
+}
+
+.dms-summary {
+  margin: 0;
+  font-weight: 600;
+}
+
+.dms-unchanged {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px dashed var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* Bulk-removal confirmation (> 25%). */
+.dms-bulk {
+  border: 1px solid var(--dsw-alias-red-primary, #d14343);
+  border-radius: 10px;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+}
+
+.dms-bulk-text {
+  margin: 0;
+  font-weight: 600;
+  color: var(--dsw-alias-red-primary, #d14343);
+}
+
+.dms-bulk-acked {
+  border-color: var(--dsw-alias-green-primary, #3e9e5c);
+}
+
+.dms-bulk-acked .dms-bulk-text {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+
+/* Protection notices. */
+.dms-protect {
+  border: 1px dashed var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.dms-protect-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.dms-protect-list {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 2px;
+}
+
+.dms-protect-unknown {
+  border-color: var(--dsw-alias-yellow-primary, #c9a227);
+  color: var(--dsw-alias-yellow-primary, #c9a227);
+}
+
+.dms-protect-unknown .dms-protect-list {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* Model groups. */
+.dms-group {
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.dms-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.dms-group-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.dms-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.dms-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.dms-check input {
+  accent-color: var(--dsw-alias-blue-primary, #4f7cff);
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.dms-model-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.dms-word {
+  flex: none;
+  font-size: 0.78rem;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dms-word-add {
+  color: var(--dsw-alias-green-primary, #3e9e5c);
+  border-color: var(--dsw-alias-green-primary, #3e9e5c);
+}
+
+.dms-word-remove {
+  color: var(--dsw-alias-red-primary, #d14343);
+  border-color: var(--dsw-alias-red-primary, #d14343);
+}
+
+.dms-word-keep {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dms-row-readonly .dms-model-id {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dms-tag-protected {
+  justify-self: end;
+  color: var(--dsw-alias-yellow-primary, #c9a227);
+  font-size: 0.82rem;
+}
+
+.dms-meta {
+  justify-self: end;
+  text-align: right;
+}
+
+.dms-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* Keyboard focus, kept inside the component scope. */
+.dms-root :focus-visible {
+  outline: 2px solid var(--dsw-alias-blue-primary, #4f7cff);
+  outline-offset: 2px;
+}
+
+/* Responsive stacking below 640px. */
+@media (max-width: 639.98px) {
+  .dms-root {
+    padding: 12px;
+  }
+
+  .dms-card {
+    padding: 12px;
+    border-radius: 10px;
+  }
+
+  .dms-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .dms-select {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .dms-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .dms-meta,
+  .dms-tag-protected {
+    justify-self: start;
+    text-align: left;
+  }
+
+  .dms-actions {
+    justify-content: flex-start;
+  }
+
+  .dms-actions .dms-button {
+    flex: 1 1 auto;
+  }
+}
